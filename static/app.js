@@ -133,6 +133,14 @@ const MAX_EDGE = 1568;
 
 let messages = [];
 let pendingImages = [];
+// Parsed documents waiting to be sent: {name, kind, chars, text, warnings,
+// truncated, status}. status is transient UI state ("uploading" | "error") and is
+// stripped before anything is archived or put on the wire.
+let pendingDocs = [];
+// In-flight parses. send() refuses while this is non-zero so a half-uploaded file
+// cannot leave without its body, and addDocs() serialises on it: two PDFs at once
+// would make the server load a second ONNX layout session.
+let docBusy = 0;
 let streaming = false;
 let abortController = null;
 let liveBubble = null;
@@ -167,6 +175,8 @@ const inputEl = $("input");
 const sendBtn = $("send-btn");
 const attachBtn = $("attach-btn");
 const fileInput = $("file-input");
+const docBtn = $("doc-btn");
+const docInput = $("doc-input");
 const previewsEl = $("previews");
 const searchToggle = $("web-search");
 const searchLabel = searchToggle.closest("label");
@@ -228,6 +238,22 @@ function savePrefs() {
   }
 }
 
+/* Keeps only what the server returned and drops the transient `status` a card in
+   flight carries. warnings is copied, not aliased: an archived snapshot must not
+   see a later mutation of the live card. */
+function stripDocStatus(doc) {
+  const d = doc || {};
+  return {
+    name: d.name || "",
+    kind: d.kind || "",
+    text: d.text || "",
+    chars: d.chars || 0,
+    pages: d.pages || 0,
+    truncated: Boolean(d.truncated),
+    warnings: [...(d.warnings || [])],
+  };
+}
+
 /* An allowlist in both directions, never JSON.stringify(messages). renderMessage
    hangs live DOM nodes off each message as _body / _status / _reasoningEl; those
    serialise to {} and then throw inside updateLive's requestAnimationFrame when
@@ -238,6 +264,9 @@ function toStored(msg) {
     content: msg.content || "",
     images: msg.images || [],
     had_images: (msg.images || []).length > 0 || Boolean(msg.hadImages),
+    // name/kind/chars/text/warnings, not just text: the card has to re-render
+    // identically when the conversation is reopened, including its warnings.
+    documents: (msg.documents || []).map(stripDocStatus),
     reasoning: msg.reasoning || "",
     sources: msg.sources || [],
     usage: msg.usage || "",
@@ -251,6 +280,7 @@ function fromStored(raw) {
     content: raw.content || "",
     images: raw.images || [],
     hadImages: Boolean(raw.had_images),
+    documents: (raw.documents || []).map(stripDocStatus),
     reasoning: raw.reasoning || "",
     sources: raw.sources || [],
     usage: raw.usage || "",
@@ -363,8 +393,17 @@ async function copyAndFlash(btn, text) {
    secondary to the answer, and one button has to mean one obvious thing. */
 function conversationText() {
   return messages
-    .filter((m) => m.content)
-    .map((m) => `${m.role === "user" ? "你" : "助手"}：\n${m.content}`)
+    .filter((m) => m.content || (m.documents || []).length)
+    .map((m) => {
+      const who = m.role === "user" ? "你" : "助手";
+      // Names only. Inlining the bodies would swamp the transcript — one PDF can
+      // be 200k characters — but dropping them silently makes a turn that was just
+      // a file plus a question copy as nothing at all.
+      const docs = (m.documents || []).length
+        ? `［附件：${m.documents.map((d) => d.name).join("、")}］\n`
+        : "";
+      return `${who}：\n${docs}${m.content}`;
+    })
     .join("\n\n");
 }
 
@@ -425,6 +464,57 @@ function buildSources(sources) {
     toggle.textContent = list.hidden ? `检索来源 ${sources.length} 条` : "收起来源";
   };
   wrap.append(toggle, list);
+  return wrap;
+}
+
+/* One collapsible card per attachment. An extracted body can run to 200k
+   characters, so it is folded away by default and scrollable when opened —
+   pouring it into the bubble would bury the question it was attached to. */
+function buildDocs(docs) {
+  if (!docs || !docs.length) return null;
+  const wrap = document.createElement("div");
+  wrap.className = "msg-docs";
+  for (const d of docs) {
+    const card = document.createElement("div");
+    card.className = "doc-card";
+    if (d.truncated) card.classList.add("truncated");
+
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "doc-toggle";
+    toggle.setAttribute("aria-expanded", "false");
+    const name = document.createElement("span");
+    name.className = "doc-name";
+    name.textContent = d.name || "未命名文件";
+    name.title = d.name || "";
+    const badge = document.createElement("span");
+    badge.className = "doc-badge";
+    badge.textContent = d.kind || "文件";
+    const size = document.createElement("span");
+    size.className = "doc-size";
+    size.textContent = d.pages
+      ? `${(d.chars || 0).toLocaleString("zh-CN")} 字 · ${d.pages} 页`
+      : `${(d.chars || 0).toLocaleString("zh-CN")} 字`;
+    toggle.append(name, badge, size);
+
+    const body = document.createElement("div");
+    body.className = "doc-body";
+    body.hidden = true;
+    body.textContent = d.text || "";
+    toggle.onclick = () => {
+      body.hidden = !body.hidden;
+      toggle.setAttribute("aria-expanded", String(!body.hidden));
+    };
+
+    card.append(toggle, body);
+    for (const w of d.warnings || []) {
+      const warn = document.createElement("div");
+      warn.className = "doc-warn";
+      warn.textContent = w;
+      card.append(warn);
+    }
+    wrap.append(card);
+  }
   return wrap;
 }
 
@@ -493,7 +583,11 @@ function renderMessage(msg) {
       bubble.append(meta);
     }
   } else {
-    bubble.textContent = msg.content;
+    const docs = buildDocs(msg.documents);
+    if (docs) bubble.append(docs);
+    // A text node, not bubble.textContent: that assignment would wipe the cards
+    // just appended. Renders identically inside a block container.
+    bubble.append(document.createTextNode(msg.content));
     // had_images is set for every message that carried pictures, including the ones
     // archived intact and rendered just above — the note is only for the conversations
     // migrated in from localStorage, which recorded the flag after dropping the pixels.
@@ -591,6 +685,104 @@ async function addFiles(fileList) {
   renderPreviews();
 }
 
+/* ------------------------------------------------------------------ *
+ * Documents
+ * ------------------------------------------------------------------ */
+
+// Must match MAX_DOCS_PER_MESSAGE in app/main.py; past it the request 422s.
+const MAX_DOCS = 3;
+const DOC_EXT = new Set(["md", "markdown", "txt", "pdf", "docx", "xlsx", "pptx"]);
+// Named separately rather than left to fall through as "unknown": these look like
+// they should work, so silence would read as a bug rather than a format limit.
+const LEGACY_EXT = { doc: "docx", xls: "xlsx", ppt: "pptx" };
+
+function extOf(name) {
+  const s = String(name || "");
+  const i = s.lastIndexOf(".");
+  return i < 0 ? "" : s.slice(i + 1).toLowerCase();
+}
+
+/* Extension first, MIME second: a dropped .txt arrives as text/plain and a .docx
+   as application/vnd…, but browsers disagree enough that the name is the more
+   reliable signal for everything except pictures. */
+function classify(file) {
+  const ext = extOf(file.name);
+  if (DOC_EXT.has(ext) || ext in LEGACY_EXT) return "doc";
+  if (String(file.type || "").startsWith("image/")) return "image";
+  return "other";
+}
+
+/* No vision gate here, unlike addFiles: text extraction has nothing to do with the
+   mmproj projector, so greying this out on a text-only model would be the most
+   annoying possible way to get the capability matrix wrong. */
+async function addDocs(fileList) {
+  // Snapshotted before the first await — the caller resets input.value straight
+  // after, which empties the live FileList out from under an async loop.
+  const files = [...fileList];
+  for (const file of files) {
+    const ext = extOf(file.name);
+    if (ext in LEGACY_EXT) {
+      alert(`不支持 2007 以前的 .${ext}，请在 Office 或 WPS 里「另存为」.${LEGACY_EXT[ext]} 后再上传`);
+      continue;
+    }
+    if (!DOC_EXT.has(ext)) continue; // dispatchFiles already reported it
+    if (pendingDocs.filter((d) => d.status !== "error").length >= MAX_DOCS) {
+      alert(`每条消息最多 ${MAX_DOCS} 个文件`);
+      break;
+    }
+    const card = {
+      name: file.name, kind: "", text: "", chars: 0, pages: 0,
+      truncated: false, warnings: [], status: "uploading",
+    };
+    pendingDocs.push(card);
+    renderPreviews();
+    docBusy++;
+    syncControls();
+    try {
+      const form = new FormData();
+      form.append("file", file, file.name);
+      const resp = await fetch("/api/documents", { method: "POST", body: form });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.detail || `HTTP ${resp.status}`);
+      // Replaced in place, not pushed: a file added while this one was in flight
+      // must not end up queued behind it. -1 means the user removed the card.
+      const at = pendingDocs.indexOf(card);
+      if (at >= 0) pendingDocs[at] = { ...stripDocStatus(data), status: "" };
+    } catch (err) {
+      // The card stays, red, with the server's own reason. No alert: the chip is
+      // already in front of the user and an alert would cover it.
+      card.status = "error";
+      card.error = err.message || "解析失败";
+    } finally {
+      docBusy--;
+      renderPreviews();
+      syncControls();
+    }
+  }
+}
+
+/* One entry point for drag and paste, which can carry both kinds at once.
+   Unknown types are named rather than ignored, because "nothing happened" gives
+   the user nothing to act on. */
+function dispatchFiles(fileList) {
+  const images = [];
+  const docs = [];
+  const other = [];
+  for (const f of fileList) {
+    const kind = classify(f);
+    if (kind === "image") images.push(f);
+    else if (kind === "doc") docs.push(f);
+    else other.push(f.name);
+  }
+  if (other.length) {
+    alert(`不支持的文件类型：${other.slice(0, 3).join("、")}${other.length > 3 ? " 等" : ""}`);
+  }
+  // addFiles is still vision-gated, so on a text-only model the pictures fall away
+  // there exactly as they did before documents existed.
+  if (images.length) addFiles(images);
+  if (docs.length) addDocs(docs);
+}
+
 function renderPreviews() {
   previewsEl.replaceChildren();
   pendingImages.forEach((src, i) => {
@@ -610,14 +802,57 @@ function renderPreviews() {
     box.append(img, remove);
     previewsEl.append(box);
   });
+  pendingDocs.forEach((doc, i) => {
+    const box = document.createElement("div");
+    box.className = "preview-doc";
+    if (doc.status === "uploading") box.classList.add("uploading");
+    if (doc.status === "error") box.classList.add("failed");
+    const name = document.createElement("div");
+    name.className = "pd-name";
+    name.textContent = doc.name;
+    name.title = doc.name;
+    const meta = document.createElement("div");
+    meta.className = "pd-meta";
+    if (doc.status === "uploading") {
+      meta.textContent = "上传解析中…";
+    } else if (doc.status === "error") {
+      meta.textContent = doc.error || "解析失败";
+    } else {
+      const bits = [doc.kind || "文件", `${(doc.chars || 0).toLocaleString("zh-CN")} 字`];
+      if (doc.pages) bits.push(`${doc.pages} 页`);
+      if (doc.warnings && doc.warnings.length) bits.push("有提示");
+      meta.textContent = bits.join(" · ");
+      if (doc.warnings && doc.warnings.length) meta.title = doc.warnings.join("\n");
+    }
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "\u00d7";
+    remove.title = "移除";
+    remove.onclick = () => {
+      pendingDocs.splice(i, 1);
+      renderPreviews();
+      syncControls();
+    };
+    box.append(name, meta, remove);
+    previewsEl.append(box);
+  });
 }
 
 attachBtn.onclick = () => fileInput.click();
 fileInput.onchange = () => { addFiles(fileInput.files); fileInput.value = ""; };
+docBtn.onclick = () => docInput.click();
+docInput.onchange = () => { addDocs(docInput.files); docInput.value = ""; };
 
 let dragDepth = 0;
+/* Widened from plain `vision`: the banner is the only hint that dropping does
+   anything at all, and a .pdf must still land on a text-only model. The file list
+   is readable during dragenter, so "is any of these a document" is answerable. */
+function dropWanted(e) {
+  if (modalOpen || ![...e.dataTransfer.types].includes("Files")) return false;
+  return vision || [...e.dataTransfer.files].some((f) => classify(f) === "doc");
+}
 window.addEventListener("dragenter", (e) => {
-  if (modalOpen || !vision || ![...e.dataTransfer.types].includes("Files")) return;
+  if (!dropWanted(e)) return;
   dragDepth++;
   dropOverlay.classList.add("active");
 });
@@ -633,14 +868,15 @@ window.addEventListener("drop", (e) => {
   dropOverlay.classList.remove("active");
   // Gated as well as dragenter: the banner cannot appear while the dialog is open,
   // but the drop still lands, and attaching to an invisible composer is worse than
-  // refusing. Same reason the preventDefault above stays unconditional.
-  if (modalOpen || !vision) return;
-  if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+  // refusing. Same reason the preventDefault above stays unconditional. The vision
+  // check moved into dispatchFiles, which still gates images but not documents.
+  if (modalOpen) return;
+  if (e.dataTransfer.files.length) dispatchFiles(e.dataTransfer.files);
 });
 
 inputEl.addEventListener("paste", (e) => {
   const files = [...(e.clipboardData?.files || [])];
-  if (files.length) { e.preventDefault(); addFiles(files); }
+  if (files.length) { e.preventDefault(); dispatchFiles(files); }
 });
 
 /* ------------------------------------------------------------------ *
@@ -660,20 +896,31 @@ function wireMessages() {
     // would re-run the vision encoder over the whole history every turn.
     // The vision check matters after switching to a text-only model, whose
     // server was started without --mmproj and rejects any image part.
+    //
+    // Documents are the OPPOSITE and must not be narrowed to the newest turn:
+    // "刚才那份文档的第二章讲了什么" only works if the body attached three turns
+    // ago is still there. Every turn keeps its bodies and the server's fit_budget
+    // decides what to drop, because only the server knows the real n_ctx. Trimming
+    // here instead would be invisible to the user and impossible to recover from.
     return {
       role: msg.role,
       content: msg.content,
       images: isLastUser && vision ? msg.images || [] : [],
+      documents: (msg.documents || []).map((d) => ({ name: d.name, text: d.text })),
     };
   });
 }
 
 async function send() {
   if (streaming) return stop();
+  // A parse in flight has no body yet, so this would attach a filename with nothing
+  // behind it. syncControls disables the button for exactly this, but Enter does not
+  // go through the button.
+  if (docBusy) return;
 
   const text = inputEl.value.trim();
-  if (!text && !pendingImages.length) return;
-  if (!text) { alert("请输入文字，或改为上传图片并提问"); return; }
+  if (!text && !pendingImages.length && !pendingDocs.length) return;
+  if (!text) { alert("请输入文字：图片和文件需要配合一个问题一起发送"); return; }
 
   // Captured for the finally below. `turn` is the array itself, not a copy: the
   // pushes that follow are what it needs to see, and 新建对话 reassigns the module
@@ -681,8 +928,17 @@ async function send() {
   const sid = currentSessionId;
   const turn = messages;
 
-  messages.push({ role: "user", content: text, images: [...pendingImages] });
+  // Cards still showing red are left out: their chip names the reason, so the user
+  // can see what is missing, and sending an empty body would look like success.
+  const docs = pendingDocs.filter((d) => !d.status).map(stripDocStatus);
+  messages.push({
+    role: "user",
+    content: text,
+    images: [...pendingImages],
+    documents: docs,
+  });
   pendingImages = [];
+  pendingDocs = [];
   renderPreviews();
   inputEl.value = "";
   autoGrow();
@@ -1443,7 +1699,9 @@ const STATE_TEXT = { ready: "运行中", external: "外部服务", loading: "加
 /* Every disabled state is derived here and nowhere else — the 15s poll below would
    otherwise revert whatever a one-off handler had set. */
 function syncControls() {
-  sendBtn.disabled = switching || runtimeState === "error";
+  // `!streaming` on the docBusy term: during a stream this button reads 停止, and
+  // a parse finishing in the background must not make the answer unstoppable.
+  sendBtn.disabled = switching || runtimeState === "error" || (!streaming && docBusy > 0);
   copyBtn.disabled = !messages.length;
   // Disabling the select while streaming is what avoids racing with stop(), which
   // is fire-and-forget and leaves `streaming` set until send()'s finally runs.

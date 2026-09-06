@@ -87,10 +87,11 @@
     <main id="chat" class="chat">
       <div id="empty" class="empty">
         <h1>本地大模型聊天</h1>
-        <p class="muted">支持对话、图片理解与联网检索，推理全部在本机 llama.cpp 上完成。</p>
+        <p class="muted">支持对话、图片理解、文档解析与联网检索，推理全部在本机 llama.cpp 上完成。</p>
         <ul class="hints muted">
           <li>左侧列表可以随时回到以前的对话，也能重命名、搜索和删除</li>
           <li>把图片拖进窗口、粘贴或直接点击附件按钮上传</li>
+          <li>点击文档按钮上传 MD / PDF / DOCX / TXT / XLSX / PPTX，解析后可结合提问分析</li>
           <li>Enter 发送，Shift+Enter 换行</li>
           <li>开启「联网检索」后，模型会在需要时自行查证并附来源</li>
         </ul>
@@ -101,6 +102,11 @@
     <footer class="composer">
       <div id="previews" class="previews"></div>
       <div class="composer-row">
+        <button id="doc-btn" class="btn btn-icon" type="button" title="上传文件（MD/PDF/DOCX/TXT/XLSX/PPTX）" aria-label="上传文件">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+            <path fill="currentColor" d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/>
+          </svg>
+        </button>
         <button id="attach-btn" class="btn btn-icon" type="button" title="上传图片" aria-label="上传图片">
           <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
             <path fill="currentColor" d="M21 19V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2zM8.5 13.5l2.5 3 3.5-4.5 4.5 6H5l3.5-4.5z"/>
@@ -110,6 +116,7 @@
         <button id="send-btn" class="btn btn-primary" type="button">发送</button>
       </div>
       <input id="file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+      <input id="doc-input" type="file" accept=".md,.markdown,.txt,.pdf,.docx,.xlsx,.pptx" multiple hidden>
     </footer>
   </div>
 </div>
@@ -164,6 +171,20 @@
             已上传的图片也会在本次请求中被剥掉，不会报错。
           </p>
 
+          <h3>文件解析</h3>
+          <p>
+            点击输入框左侧的文档按钮，或把文件拖进窗口，即可上传
+            <code>.md .txt .pdf .docx .xlsx .pptx</code>；单条消息最多 3 个，单个不超过 25MB。
+            解析在服务端完成，提取出的正文以可折叠卡片显示，展开可以核对内容。
+            发送时正文会和你的问题一起进入上下文，之后每一轮追问都仍然带着，所以能连续追问同一份文件。
+          </p>
+          <p>
+            几点限制：2007 以前的 <code>.doc / .xls / .ppt</code> 无法解析，请在 Office 或 WPS 里「另存为」新格式后再上传；
+            扫描版 PDF 只有图片没有文字层，本应用不做 OCR，会明确提示，此时可以改用图片上传（视觉模型支持看图）；
+            当历史加文档超过模型上下文预算时，会自动省略最旧那几轮的文档正文并在状态行说明，最新一份永远保留，不会报错。
+            首次解析 PDF 需要加载布局分析模型，会慢几秒。
+          </p>
+
           <h3>联网检索</h3>
           <p>
             勾选顶栏「联网检索」后，模型会自行判断是否需要查证，而不是每条消息都搜。
@@ -192,7 +213,7 @@
   </div>
 </div>
 
-<div id="drop-overlay" class="drop-overlay"><span>松开以添加图片</span></div>
+<div id="drop-overlay" class="drop-overlay"><span>松开以添加图片或文件</span></div>
 <script src="/static/app.js"></script>
 </body>
 </html>

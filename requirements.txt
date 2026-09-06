@@ -3,3 +3,14 @@ uvicorn[standard]>=0.52
 httpx>=0.28
 python-dotenv>=1.2
 pydantic-settings>=2.15
+
+# Document upload / parsing.
+# Keep this file pure ASCII: pip decodes it with the locale codec (cp936 here),
+# not UTF-8, so a Chinese comment makes the whole install fail with
+# UnicodeDecodeError before a single wheel is downloaded.
+python-multipart>=0.0.32   # required by FastAPI's UploadFile/File
+openpyxl>=3.1              # .xlsx
+# Pinned exactly: since 1.27.2.3 pymupdf4llm hard-depends on pymupdf_layout
+# (a 41MB ONNX layout model, pulling numpy/onnxruntime/networkx, ~93MB total).
+# A floating >= would let a future `pip install -U` swap that whole stack.
+pymupdf4llm==1.28.2        # .pdf -> Markdown

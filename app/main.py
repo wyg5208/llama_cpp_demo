@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
@@ -16,6 +16,14 @@ from starlette.datastructures import MutableHeaders
 
 from . import history
 from .config import ROOT, Settings, get_settings
+from .documents import (
+    DOC_MAX_CHARS,
+    MAX_DOC_BYTES,
+    DocumentError,
+    check_filename,
+    fit_budget,
+    parse_document,
+)
 from .llm import ChatMessage, stream_chat
 from .models import find_model, save_active_model, scan_models
 from .runtime import LlamaRuntime, RuntimeUnavailable
@@ -35,6 +43,10 @@ log = logging.getLogger("app")
 DATA_URL_RE = re.compile(r"^data:image/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=\s]+$")
 MAX_IMAGE_BYTES = 12_000_000
 MAX_IMAGES_PER_MESSAGE = 4
+# Lower than the image cap on purpose: an image costs one encoder pass, while a
+# document body costs thousands of prompt tokens on every turn it stays in the
+# history, so the context budget binds long before the upload size does.
+MAX_DOCS_PER_MESSAGE = 3
 # The wire cap is the tighter one: llama-server pays for every message in prompt
 # tokens. The archive is looser so a long conversation keeps the turns the wire has
 # stopped sending instead of being silently truncated on disk.
@@ -100,10 +112,24 @@ app = FastAPI(title="llama.cpp 本地聊天", lifespan=lifespan)
 app.add_middleware(RevalidateAssets)
 
 
+class DocumentIn(BaseModel):
+    """An attachment's extracted text, replayed by the browser on every turn.
+
+    The body round-trips through the client instead of living in a server-side
+    upload store: there is then nothing to expire or orphan, and a session
+    restored from the archive still carries the text it was analysed with. Same
+    trade-off as base64 images, already accepted for the archive.
+    """
+
+    name: str = Field(default="", max_length=200)
+    text: str = Field(default="", max_length=DOC_MAX_CHARS)
+
+
 class MessageIn(BaseModel):
     role: Literal["user", "assistant"]
     content: str = ""
     images: list[str] = Field(default_factory=list, max_length=MAX_IMAGES_PER_MESSAGE)
+    documents: list[DocumentIn] = Field(default_factory=list, max_length=MAX_DOCS_PER_MESSAGE)
 
     @field_validator("images")
     @classmethod
@@ -400,6 +426,39 @@ async def session_delete(session_id: str) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@app.post("/api/documents")
+async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
+    """Parse an uploaded file and hand the extracted text back to the browser."""
+    name = file.filename or ""
+    try:
+        # On the name alone, before reading a byte: an .exe or a .doc costs
+        # nothing to refuse and everything to buffer first.
+        check_filename(name)
+    except DocumentError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await file.read(1024 * 1024):
+        total += len(chunk)
+        if total > MAX_DOC_BYTES:
+            raise HTTPException(
+                413, f"文件超过 {MAX_DOC_BYTES // 1_000_000}MB 上限，已中止读取。"
+            )
+        chunks.append(chunk)
+
+    try:
+        # Off the event loop: parsing is blocking CPU work, and the PDF path runs
+        # an ONNX layout inference per page (~0.3-0.5 s each, measured).
+        parsed = await run_in_threadpool(parse_document, name, b"".join(chunks))
+    except DocumentError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - only the type reaches the browser
+        log.exception("document parse failed: %s", name[:200])
+        raise HTTPException(500, f"解析失败：{type(exc).__name__}") from exc
+    return JSONResponse(parsed.to_dict())
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest) -> StreamingResponse:
     assert runtime is not None
@@ -414,7 +473,16 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             media_type="text/event-stream",
         )
 
-    history = [ChatMessage(role=m.role, content=m.content, images=m.images) for m in req.messages]
+    # This local `history` shadows the history module; the module is not used below.
+    history = [
+        ChatMessage(
+            role=m.role,
+            content=m.content,
+            images=m.images,
+            documents=[(d.name, d.text) for d in m.documents],
+        )
+        for m in req.messages
+    ]
 
     # Search is implemented as a tool call, so a model whose template cannot call
     # tools cannot search. Clamping here rather than trusting the browser covers a
@@ -423,10 +491,31 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     if req.web_search and not use_search:
         log.warning("ignoring web_search: %s does not support tool calls", runtime.model_path.name)
 
+    s = get_settings()
+    # The server's own figure, not a local guess: /props reports what llama-server
+    # actually allocated for the slot, which n_ctx_overrides only approximates.
+    n_ctx = int(runtime.status().get("n_ctx") or s.n_ctx_for(runtime.model_path))
+    reserve = s.thinking_max_tokens if req.thinking else s.max_tokens
+    fitted, notes = fit_budget(history, n_ctx, reserve)
+    if notes:
+        log.info(
+            "context trimmed %d -> %d messages: %s", len(history), len(fitted), " ".join(notes)
+        )
+
     async def events() -> AsyncIterator[str]:
+        # One joined line rather than an event per note: the UI keeps a single
+        # status slot, so separate events would overwrite each other and only the
+        # last would ever be read.
+        if notes:
+            yield sse("status", {"text": " ".join(notes)})
+        if not fitted:
+            # fit_budget empties the list only when even the last message will not
+            # fit; notes[0] is the reason it computed for exactly that case.
+            yield sse("error", {"text": notes[0] if notes else "上下文长度不足，请新建对话。"})
+            return
         try:
             async for event in stream_chat(
-                get_settings(), history, use_search, req.thinking
+                get_settings(), fitted, use_search, req.thinking
             ):
                 yield sse(event["type"], event)
         except Exception as exc:  # noqa: BLE001 - surface any failure to the browser
