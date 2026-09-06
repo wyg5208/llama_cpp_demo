@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>llama.cpp 本地聊天</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span id="state-dot" class="dot dot-idle"></span>
+    <div class="brand-text">
+      <strong id="model-name">加载中…</strong>
+      <span id="runtime-meta" class="muted">正在连接 llama-server</span>
+    </div>
+  </div>
+  <div id="sys-stats" class="sys-stats">
+    <span class="stat stat-optional" title="CPU 使用率（全部逻辑核的平均）">CPU <b id="st-cpu">–</b></span>
+    <span class="stat" title="物理内存 已用 / 总量">内存 <b id="st-ram">–</b></span>
+    <span class="stat" id="st-gpu-wrap" title="GPU 核心使用率">GPU <b id="st-gpu">–</b></span>
+    <span class="stat" title="显存 已用 / 总量">显存 <b id="st-vram">–</b></span>
+    <span class="stat" id="st-temp-wrap" title="GPU 芯片温度">温度 <b id="st-temp">–</b></span>
+  </div>
+  <div class="topbar-actions">
+    <button id="sidebar-toggle" class="btn btn-ghost btn-icon sidebar-toggle" type="button"
+            title="显示或隐藏历史对话" aria-label="显示或隐藏历史对话" aria-expanded="false">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path fill="currentColor" d="M3 6h18v2H3V6zm0 5h18v2H3v-2zm0 5h18v2H3v-2z"/>
+      </svg>
+    </button>
+    <select id="model-select" class="select" title="切换本地模型" disabled>
+      <option value="">加载中…</option>
+    </select>
+    <label class="toggle" title="开启后模型会先输出思考过程，更慢但更适合复杂推理">
+      <input type="checkbox" id="thinking">
+      <span>深度思考</span>
+    </label>
+    <label class="toggle" title="开启后模型可自行决定是否联网检索">
+      <input type="checkbox" id="web-search">
+      <span>联网检索</span>
+    </label>
+    <button id="copy-btn" class="btn btn-ghost btn-icon" type="button" title="复制整个对话" aria-label="复制整个对话">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
+      </svg>
+    </button>
+    <button id="new-chat-btn" class="btn btn-ghost" type="button"
+            title="开始一段新对话，当前对话会保留在左侧列表">新建对话</button>
+  </div>
+</header>
+
+<div class="workspace">
+  <aside id="sidebar" class="sidebar">
+    <div class="sidebar-head">
+      <button id="new-btn" class="btn btn-primary" type="button">新建对话</button>
+      <input id="session-search" class="session-search" type="search"
+             placeholder="搜索历史对话…" title="按标题或对话内容过滤">
+    </div>
+    <div id="session-list" class="session-list"></div>
+  </aside>
+
+  <div class="chatcol">
+    <main id="chat" class="chat">
+      <div id="empty" class="empty">
+        <h1>本地大模型聊天</h1>
+        <p class="muted">支持对话、图片理解与联网检索，推理全部在本机 llama.cpp 上完成。</p>
+        <ul class="hints muted">
+          <li>左侧列表可以随时回到以前的对话，也能重命名、搜索和删除</li>
+          <li>把图片拖进窗口、粘贴或直接点击附件按钮上传</li>
+          <li>Enter 发送，Shift+Enter 换行</li>
+          <li>开启「联网检索」后，模型会在需要时自行查证并附来源</li>
+        </ul>
+      </div>
+      <div id="messages"></div>
+    </main>
+
+    <footer class="composer">
+      <div id="previews" class="previews"></div>
+      <div class="composer-row">
+        <button id="attach-btn" class="btn btn-icon" type="button" title="上传图片" aria-label="上传图片">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+            <path fill="currentColor" d="M21 19V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2zM8.5 13.5l2.5 3 3.5-4.5 4.5 6H5l3.5-4.5z"/>
+          </svg>
+        </button>
+        <textarea id="input" rows="1" placeholder="输入消息…（Enter 发送，Shift+Enter 换行）"></textarea>
+        <button id="send-btn" class="btn btn-primary" type="button">发送</button>
+      </div>
+      <input id="file-input" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden>
+    </footer>
+  </div>
+</div>
+
+<div id="drop-overlay" class="drop-overlay"><span>松开以添加图片</span></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

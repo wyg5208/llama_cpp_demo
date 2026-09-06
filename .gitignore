@@ -1,0 +1,12 @@
+# Secrets: the real .env holds the BOCHA / Tavily API keys. .env.example is tracked.
+.env
+
+# Virtualenv and bytecode
+.venv/
+__pycache__/
+*.pyc
+
+# Everything the app writes at runtime: the extracted llama.cpp build (hundreds of
+# MB of binaries), the server log, the remembered model choice, the chat archive
+# and the settings override file.
+runtime/

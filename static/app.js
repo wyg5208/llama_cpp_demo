@@ -1,0 +1,1323 @@
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * Minimal Markdown renderer.
+ * No CDN is used on purpose: this machine's network cannot reach the
+ * usual JS CDNs reliably. Input is HTML-escaped before any markup is
+ * applied, and link targets are restricted to http(s).
+ * ------------------------------------------------------------------ */
+
+const ESCAPES = [["&", "&amp;"], ["<", "&lt;"], [">", "&gt;"], ['"', "&quot;"], ["'", "&#39;"]];
+
+function escapeHtml(text) {
+  return text.replace(/[&<>"']/g, (ch) => ESCAPES.find(([c]) => c === ch)[1]);
+}
+
+function safeLink(label, target) {
+  return /^https?:\/\//i.test(target)
+    ? `<a href="${target}" target="_blank" rel="noopener noreferrer">${label}</a>`
+    : label;
+}
+
+function inlineMarkdown(text) {
+  const stash = [];
+  const keep = (html) => `\u0001${stash.push(html) - 1}\u0001`;
+
+  let out = text.replace(/`([^`\n]+)`/g, (_, code) => keep(`<code>${code}</code>`));
+  out = out.replace(/\[([^\]\n]*)\]\(([^)\s]+)\)/g, (_, label, url) => keep(safeLink(label, url)));
+  out = out.replace(/(^|[\s(])(https?:\/\/[^\s<>()"']+)/g, (_, pre, url) =>
+    pre + keep(safeLink(url, url.replace(/&amp;/g, "&")))
+  );
+  out = out
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  return out.replace(/\u0001(\d+)\u0001/g, (_, i) => stash[Number(i)]);
+}
+
+const isTableRow = (line) => /^\s*\|.*\|\s*$/.test(line);
+const isTableDivider = (line) => /^\s*\|[\s:|-]+\|\s*$/.test(line) && line.includes("-");
+const splitRow = (line) =>
+  line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((c) => c.trim());
+
+function renderMarkdown(src) {
+  const fences = [];
+  let text = src.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+    const cls = lang.trim() ? ` class="language-${escapeHtml(lang.trim())}"` : "";
+    fences.push(`<pre><code${cls}>${escapeHtml(code.replace(/\n$/, ""))}</code></pre>`);
+    return `\u0000${fences.length - 1}\u0000`;
+  });
+
+  text = escapeHtml(text);
+  const lines = text.split("\n");
+
+  let html = "";
+  let paragraph = [];
+  let listTag = null;
+  let tableRows = [];
+
+  const flushParagraph = () => {
+    if (paragraph.length) html += `<p>${inlineMarkdown(paragraph.join("\n"))}</p>`;
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (listTag) { html += `</${listTag}>`; listTag = null; }
+  };
+  const flushTable = () => {
+    if (!tableRows.length) return;
+    const rows = tableRows.filter((r) => !isTableDivider(r.raw));
+    const hasHeader = tableRows.some((r) => isTableDivider(r.raw));
+    let out = "<table>";
+    rows.forEach((row, i) => {
+      const tag = hasHeader && i === 0 ? "th" : "td";
+      out += "<tr>" + splitRow(row.raw).map((c) => `<${tag}>${inlineMarkdown(c)}</${tag}>`).join("") + "</tr>";
+    });
+    html += out + "</table>";
+    tableRows = [];
+  };
+  const flushAll = () => { flushParagraph(); flushList(); flushTable(); };
+
+  for (const line of lines) {
+    const fence = /^\u0000(\d+)\u0000$/.exec(line.trim());
+    if (fence) { flushAll(); html += fences[Number(fence[1])]; continue; }
+
+    if (isTableRow(line)) { flushParagraph(); flushList(); tableRows.push({ raw: line }); continue; }
+    flushTable();
+
+    if (!line.trim()) { flushParagraph(); flushList(); continue; }
+
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading) {
+      flushParagraph(); flushList();
+      const level = heading[1].length;
+      html += `<h${level}>${inlineMarkdown(heading[2])}</h${level}>`;
+      continue;
+    }
+    if (/^\s*([-*_])\s*\1\s*\1[\s-*_]*$/.test(line)) { flushParagraph(); flushList(); html += "<hr>"; continue; }
+
+    const quote = /^\s*&gt;\s?(.*)$/.exec(line);
+    if (quote) {
+      flushParagraph(); flushList();
+      html += `<blockquote><p>${inlineMarkdown(quote[1])}</p></blockquote>`;
+      continue;
+    }
+
+    const bullet = /^\s*[-*+]\s+(.*)$/.exec(line);
+    const ordered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+    const item = bullet || ordered;
+    if (item) {
+      flushParagraph();
+      const want = bullet ? "ul" : "ol";
+      if (listTag !== want) { flushList(); html += `<${want}>`; listTag = want; }
+      html += `<li>${inlineMarkdown(item[1])}</li>`;
+      continue;
+    }
+
+    if (listTag) flushList();
+    paragraph.push(line.trim());
+  }
+  flushAll();
+  return html;
+}
+
+/* ------------------------------------------------------------------ *
+ * State
+ * ------------------------------------------------------------------ */
+
+// Conversations live on the server now; this key is read once, by the migration.
+const LEGACY_KEY = "llama-cpp-demo.history.v1";
+// The two checkboxes stay in the browser and stay global: reopening an old
+// conversation should not silently change what the next turn will do.
+const PREFS_KEY = "llama-cpp-demo.prefs.v1";
+const MAX_EDGE = 1568;
+
+let messages = [];
+let pendingImages = [];
+let streaming = false;
+let abortController = null;
+let liveBubble = null;
+let liveStatus = null;
+let switching = false;
+let runtimeState = "stopped";
+let vision = false;
+// null until the first status arrives, so a restored web-search tick is dropped
+// silently on page load and only a real capability *transition* warns the user.
+let tools = null;
+let canSwitch = false;
+let currentModelId = "";
+
+let sessions = [];
+// null for a conversation that has not been saved yet — sessions are created
+// lazily so the sidebar does not fill with rows somebody abandoned half-typed.
+let currentSessionId = null;
+let saveChain = Promise.resolve();
+let saveFailed = false;
+
+const $ = (id) => document.getElementById(id);
+const messagesEl = $("messages");
+const emptyEl = $("empty");
+const inputEl = $("input");
+const sendBtn = $("send-btn");
+const attachBtn = $("attach-btn");
+const fileInput = $("file-input");
+const previewsEl = $("previews");
+const searchToggle = $("web-search");
+const searchLabel = searchToggle.closest("label");
+const SEARCH_TITLE = searchLabel.title;
+const thinkingToggle = $("thinking");
+const newChatBtn = $("new-chat-btn");
+const copyBtn = $("copy-btn");
+const modelSelect = $("model-select");
+const sidebarEl = $("sidebar");
+const sidebarToggle = $("sidebar-toggle");
+const newBtn = $("new-btn");
+const sessionListEl = $("session-list");
+const sessionSearch = $("session-search");
+const dropOverlay = $("drop-overlay");
+const stateDot = $("state-dot");
+const modelName = $("model-name");
+const runtimeMeta = $("runtime-meta");
+const stCpu = $("st-cpu");
+const stRam = $("st-ram");
+const stGpu = $("st-gpu");
+const stVram = $("st-vram");
+const stTemp = $("st-temp");
+const gpuStatWrap = $("st-gpu-wrap");
+const tempStatWrap = $("st-temp-wrap");
+const GPU_STAT_TITLE = gpuStatWrap.title;
+
+function loadPrefs() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(PREFS_KEY) || "{}");
+    if (typeof saved.webSearch === "boolean") searchToggle.checked = saved.webSearch;
+    if (typeof saved.thinking === "boolean") thinkingToggle.checked = saved.thinking;
+  } catch {
+    /* first run, or a value somebody hand-edited: keep the defaults */
+  }
+}
+
+function savePrefs() {
+  try {
+    localStorage.setItem(
+      PREFS_KEY,
+      JSON.stringify({ webSearch: searchToggle.checked, thinking: thinkingToggle.checked })
+    );
+  } catch {
+    /* private mode or quota: the checkboxes simply are not remembered */
+  }
+}
+
+/* An allowlist in both directions, never JSON.stringify(messages). renderMessage
+   hangs live DOM nodes off each message as _body / _status / _reasoningEl; those
+   serialise to {} and then throw inside updateLive's requestAnimationFrame when
+   the conversation is reopened, which kills the stick-to-bottom scroll. */
+function toStored(msg) {
+  return {
+    role: msg.role,
+    content: msg.content || "",
+    images: msg.images || [],
+    had_images: (msg.images || []).length > 0 || Boolean(msg.hadImages),
+    reasoning: msg.reasoning || "",
+    sources: msg.sources || [],
+    usage: msg.usage || "",
+    error: Boolean(msg.error),
+  };
+}
+
+function fromStored(raw) {
+  return {
+    role: raw.role,
+    content: raw.content || "",
+    images: raw.images || [],
+    hadImages: Boolean(raw.had_images),
+    reasoning: raw.reasoning || "",
+    sources: raw.sources || [],
+    usage: raw.usage || "",
+    error: Boolean(raw.error),
+  };
+}
+
+/* `sid` and `snapshot` are passed in rather than read from the globals: send()'s
+   finally runs after an abort, by which point 新建对话 may already have swapped in
+   a different array. The finished turn belongs to the conversation it started in. */
+async function saveConversation(sid, snapshot) {
+  try {
+    const resp = await fetch(sid ? `/api/sessions/${sid}` : "/api/sessions", {
+      method: sid ? "PATCH" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: snapshot.map(toStored) }),
+    });
+    if (!resp.ok) {
+      const detail = (await resp.json().catch(() => ({}))).detail;
+      throw new Error(detail || `HTTP ${resp.status}`);
+    }
+    const record = await resp.json();
+    saveFailed = false;
+    // Adopt the new id only while the user is still looking at that conversation;
+    // otherwise 新建对话 orphaned it mid-stream and only the list needs to know.
+    if (!sid && currentSessionId === null && messages === snapshot) {
+      currentSessionId = record.id;
+    }
+    await refreshSessions();
+  } catch (err) {
+    // currentSessionId is deliberately left alone so the next turn retries the
+    // create, and the messages are never dropped. One alert per failure streak:
+    // send()'s finally is not something the user waits on, so a retry queue would
+    // be invisible, but believing a conversation was saved when it was not is worse.
+    if (!saveFailed) {
+      saveFailed = true;
+      alert(`对话未能保存到本地历史：${err.message}`);
+    }
+  }
+}
+
+function queueSave(sid, snapshot) {
+  const run = () => saveConversation(sid, snapshot);
+  saveChain = saveChain.then(run);
+  return saveChain;
+}
+
+/* ------------------------------------------------------------------ *
+ * Clipboard
+ * ------------------------------------------------------------------ */
+
+const ICON_COPY = "M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z";
+const ICON_CHECK = "M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z";
+
+async function clipboardWrite(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  // HOST is configurable, so the page can be opened over a LAN address, which is
+  // not a secure context and therefore has no navigator.clipboard at all.
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.readOnly = true;
+  ta.style.cssText = "position:fixed;top:0;left:0;opacity:0";
+  document.body.append(ta);
+  ta.select();
+  const ok = document.execCommand("copy");
+  ta.remove();
+  if (!ok) throw new Error("浏览器拒绝了复制");
+}
+
+function iconButton(label, size, path = ICON_COPY) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "msg-copy";
+  btn.title = label;
+  btn.setAttribute("aria-label", label);
+  btn.innerHTML =
+    `<svg viewBox="0 0 24 24" width="${size}" height="${size}" aria-hidden="true">` +
+    `<path fill="currentColor" d="${path}"/></svg>`;
+  return btn;
+}
+
+async function copyAndFlash(btn, text) {
+  try {
+    await clipboardWrite(text);
+  } catch (err) {
+    alert(`复制失败：${err.message}`);
+    return;
+  }
+  const path = btn.querySelector("svg path");
+  // Remembered once, not read back from an attribute: the topbar button is authored
+  // in HTML and carries no data-label, and a rapid second click would otherwise
+  // capture "已复制" as the thing to restore.
+  btn._label ??= btn.title;
+  path.setAttribute("d", ICON_CHECK);
+  btn.classList.add("copied");
+  btn.title = "已复制";
+  clearTimeout(btn._timer);
+  btn._timer = setTimeout(() => {
+    path.setAttribute("d", ICON_COPY);
+    btn.classList.remove("copied");
+    btn.title = btn._label;
+  }, 1200);
+}
+
+/* Copies raw Markdown rather than the rendered HTML, because that is what pastes
+   usefully anywhere else. Reasoning and sources are left out on purpose: they are
+   secondary to the answer, and one button has to mean one obvious thing. */
+function conversationText() {
+  return messages
+    .filter((m) => m.content)
+    .map((m) => `${m.role === "user" ? "你" : "助手"}：\n${m.content}`)
+    .join("\n\n");
+}
+
+/* ------------------------------------------------------------------ *
+ * Rendering
+ * ------------------------------------------------------------------ */
+
+function hostOf(url) {
+  try { return new URL(url).host; } catch { return url; }
+}
+
+function buildReasoning(text, open) {
+  const det = document.createElement("details");
+  det.className = "reasoning";
+  det.open = open;
+  const sum = document.createElement("summary");
+  sum.textContent = "思考过程";
+  const body = document.createElement("div");
+  body.className = "md";
+  body.innerHTML = text ? renderMarkdown(text) : "";
+  det.append(sum, body);
+  return det;
+}
+
+function buildSources(sources) {
+  if (!sources.length) return null;
+  const wrap = document.createElement("div");
+  wrap.className = "sources";
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.className = "sources-toggle";
+  toggle.textContent = `检索来源 ${sources.length} 条`;
+  const list = document.createElement("div");
+  list.className = "sources-list";
+  list.hidden = true;
+  for (const s of sources) {
+    const row = document.createElement("div");
+    row.className = "source";
+    const idx = document.createElement("span");
+    idx.className = "source-index";
+    idx.textContent = `[${s.index}]`;
+    const body = document.createElement("div");
+    body.className = "source-body";
+    const link = document.createElement("a");
+    link.href = s.url;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.textContent = s.title || s.url;
+    const host = document.createElement("div");
+    host.className = "source-host";
+    host.textContent = hostOf(s.url);
+    body.append(link, host);
+    row.append(idx, body);
+    list.append(row);
+  }
+  toggle.onclick = () => {
+    list.hidden = !list.hidden;
+    toggle.textContent = list.hidden ? `检索来源 ${sources.length} 条` : "收起来源";
+  };
+  wrap.append(toggle, list);
+  return wrap;
+}
+
+function renderMessage(msg) {
+  const wrap = document.createElement("div");
+  wrap.className = `msg msg-${msg.role}`;
+
+  const role = document.createElement("div");
+  role.className = "msg-role";
+  const label = document.createElement("span");
+  label.textContent = msg.role === "user" ? "你" : "助手";
+  role.append(label);
+  // Read at click time, not here: the same msg object keeps mutating while the
+  // answer streams in. Skipped while empty so the "正在思考…" placeholder does not
+  // offer a button that would copy nothing; renderMessageInto rebuilds the node
+  // once text has arrived.
+  if (msg.content) {
+    const copy = iconButton(msg.role === "user" ? "复制这条消息" : "复制这条回答", 14);
+    copy.onclick = () => copyAndFlash(copy, msg.content);
+    role.append(copy);
+  }
+  wrap.append(role);
+
+  if (msg.images && msg.images.length) {
+    const box = document.createElement("div");
+    box.className = "msg-images";
+    for (const src of msg.images) {
+      const img = document.createElement("img");
+      img.src = src;
+      img.alt = "上传的图片";
+      box.append(img);
+    }
+    wrap.append(box);
+  }
+
+  const bubble = document.createElement("div");
+  bubble.className = "bubble";
+  if (msg.error) bubble.classList.add("error");
+
+  if (msg.role === "assistant") {
+    const body = document.createElement("div");
+    body.className = "md";
+    body.innerHTML = msg.content ? renderMarkdown(msg.content) : "";
+    bubble.append(body);
+    msg._body = body;
+
+    if (msg.reasoning) {
+      const det = buildReasoning(msg.reasoning, false);
+      msg._reasoningEl = det.querySelector(".md");
+      bubble.insertBefore(det, body);
+    }
+
+    if (msg.status) {
+      const status = document.createElement("div");
+      status.className = "status-line";
+      status.textContent = msg.status;
+      bubble.prepend(status);
+      msg._status = status;
+    }
+    const sources = buildSources(msg.sources || []);
+    if (sources) bubble.append(sources);
+    if (msg.usage) {
+      const meta = document.createElement("div");
+      meta.className = "meta";
+      meta.textContent = msg.usage;
+      bubble.append(meta);
+    }
+  } else {
+    bubble.textContent = msg.content;
+    // had_images is set for every message that carried pictures, including the ones
+    // archived intact and rendered just above — the note is only for the conversations
+    // migrated in from localStorage, which recorded the flag after dropping the pixels.
+    if (msg.hadImages && !(msg.images && msg.images.length)) {
+      const note = document.createElement("div");
+      note.className = "meta";
+      note.textContent = "（这条消息的图片没有保存下来）";
+      bubble.append(note);
+    }
+  }
+
+  wrap.append(bubble);
+  return wrap;
+}
+
+function renderAll() {
+  messagesEl.replaceChildren();
+  emptyEl.hidden = messages.length > 0;
+  for (const msg of messages) messagesEl.append(renderMessage(msg));
+  liveBubble = null;
+  liveStatus = null;
+  scrollToBottom(true);
+  // Every path that changes the message list comes through here, so this is what
+  // stops the copy button from staying enabled after 清空对话 until the next poll.
+  syncControls();
+}
+
+let atBottom = true;
+const chatEl = $("chat");
+chatEl.addEventListener("scroll", () => {
+  atBottom = chatEl.scrollHeight - chatEl.scrollTop - chatEl.clientHeight < 90;
+});
+
+function scrollToBottom(force = false) {
+  if (force || atBottom) chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+let renderQueued = false;
+function updateLive(force = false) {
+  if (renderQueued && !force) return;
+  renderQueued = true;
+  requestAnimationFrame(() => {
+    renderQueued = false;
+    const msg = messages[messages.length - 1];
+    if (!msg || msg.role !== "assistant" || !msg._body) return;
+    msg._body.innerHTML = msg.content ? renderMarkdown(msg.content) : "";
+    msg._body.classList.toggle("cursor", streaming);
+    if (msg._reasoningEl) msg._reasoningEl.innerHTML = renderMarkdown(msg.reasoning || "");
+    scrollToBottom();
+  });
+}
+
+/* ------------------------------------------------------------------ *
+ * Images
+ * ------------------------------------------------------------------ */
+
+function downscale(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("读取失败"));
+    reader.onload = () => {
+      const img = new Image();
+      img.onerror = () => reject(new Error("不是有效图片"));
+      img.onload = () => {
+        const scale = Math.min(1, MAX_EDGE / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * scale));
+        const h = Math.max(1, Math.round(img.height * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+        const isPng = file.type === "image/png";
+        resolve(canvas.toDataURL(isPng ? "image/png" : "image/jpeg", isPng ? undefined : 0.88));
+      };
+      img.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function addFiles(fileList) {
+  if (!vision) return;
+  const files = [...fileList].filter((f) => f.type.startsWith("image/"));
+  for (const file of files) {
+    if (pendingImages.length >= 4) {
+      alert("每条消息最多 4 张图片");
+      break;
+    }
+    try {
+      pendingImages.push(await downscale(file));
+    } catch (err) {
+      alert(`图片处理失败：${err.message}`);
+    }
+  }
+  renderPreviews();
+}
+
+function renderPreviews() {
+  previewsEl.replaceChildren();
+  pendingImages.forEach((src, i) => {
+    const box = document.createElement("div");
+    box.className = "preview";
+    const img = document.createElement("img");
+    img.src = src;
+    img.alt = `待发送图片 ${i + 1}`;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "\u00d7";
+    remove.title = "移除";
+    remove.onclick = () => {
+      pendingImages.splice(i, 1);
+      renderPreviews();
+    };
+    box.append(img, remove);
+    previewsEl.append(box);
+  });
+}
+
+attachBtn.onclick = () => fileInput.click();
+fileInput.onchange = () => { addFiles(fileInput.files); fileInput.value = ""; };
+
+let dragDepth = 0;
+window.addEventListener("dragenter", (e) => {
+  if (!vision || ![...e.dataTransfer.types].includes("Files")) return;
+  dragDepth++;
+  dropOverlay.classList.add("active");
+});
+// Deliberately not vision-gated: without an unconditional preventDefault, dropping
+// a file on a text-only model navigates the tab away from the app.
+window.addEventListener("dragover", (e) => e.preventDefault());
+window.addEventListener("dragleave", () => {
+  if (--dragDepth <= 0) { dragDepth = 0; dropOverlay.classList.remove("active"); }
+});
+window.addEventListener("drop", (e) => {
+  e.preventDefault();
+  dragDepth = 0;
+  dropOverlay.classList.remove("active");
+  if (!vision) return;
+  if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
+});
+
+inputEl.addEventListener("paste", (e) => {
+  const files = [...(e.clipboardData?.files || [])];
+  if (files.length) { e.preventDefault(); addFiles(files); }
+});
+
+/* ------------------------------------------------------------------ *
+ * Sending
+ * ------------------------------------------------------------------ */
+
+// Must match MAX_CHAT_MESSAGES in app/main.py. A resumed conversation can be much
+// longer than one sitting, so send the tail: past the cap the request 422s and the
+// conversation would otherwise become permanently unsendable.
+const MAX_CHAT_MESSAGES = 200;
+
+function wireMessages() {
+  const out = messages.slice(-MAX_CHAT_MESSAGES);
+  return out.map((msg, i) => {
+    const isLastUser = msg.role === "user" && i === out.length - 2;
+    // Only the newest user turn keeps its pixels; re-sending older images
+    // would re-run the vision encoder over the whole history every turn.
+    // The vision check matters after switching to a text-only model, whose
+    // server was started without --mmproj and rejects any image part.
+    return {
+      role: msg.role,
+      content: msg.content,
+      images: isLastUser && vision ? msg.images || [] : [],
+    };
+  });
+}
+
+async function send() {
+  if (streaming) return stop();
+
+  const text = inputEl.value.trim();
+  if (!text && !pendingImages.length) return;
+  if (!text) { alert("请输入文字，或改为上传图片并提问"); return; }
+
+  // Captured for the finally below. `turn` is the array itself, not a copy: the
+  // pushes that follow are what it needs to see, and 新建对话 reassigns the module
+  // binding rather than emptying this array in place.
+  const sid = currentSessionId;
+  const turn = messages;
+
+  messages.push({ role: "user", content: text, images: [...pendingImages] });
+  pendingImages = [];
+  renderPreviews();
+  inputEl.value = "";
+  autoGrow();
+
+  const assistant = { role: "assistant", content: "", sources: [], status: "正在思考…" };
+  messages.push(assistant);
+  emptyEl.hidden = true;
+  renderAll();
+
+  const node = messagesEl.lastElementChild;
+  liveBubble = node.querySelector(".bubble");
+  assistant._body = node.querySelector(".md");
+  assistant._status = node.querySelector(".status-line");
+  liveStatus = assistant._status;
+
+  streaming = true;
+  atBottom = true;
+  sendBtn.textContent = "停止";
+  abortController = new AbortController();
+  syncControls();
+
+  try {
+    const resp = await fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: wireMessages(),
+        web_search: searchToggle.checked,
+        thinking: thinkingToggle.checked,
+      }),
+      signal: abortController.signal,
+    });
+    if (!resp.ok || !resp.body) throw new Error(`HTTP ${resp.status}`);
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let sep;
+      while ((sep = buffer.indexOf("\n\n")) >= 0) {
+        const frame = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+        const dataLines = [];
+        let eventName = "message";
+        for (const line of frame.split("\n")) {
+          if (line.startsWith("event:")) eventName = line.slice(6).trim();
+          else if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+        }
+        if (!dataLines.length) continue;
+        handleEvent(eventName, JSON.parse(dataLines.join("\n")), assistant);
+      }
+    }
+  } catch (err) {
+    if (err.name !== "AbortError") {
+      assistant.error = true;
+      assistant.content = assistant.content || `请求失败：${err.message}`;
+    }
+  } finally {
+    streaming = false;
+    abortController = null;
+    sendBtn.textContent = "发送";
+    assistant.status = "";
+    syncControls();
+    renderMessageInto(node, assistant);
+    queueSave(sid, turn);
+  }
+}
+
+function renderMessageInto(node, msg) {
+  const fresh = renderMessage(msg);
+  node.replaceWith(fresh);
+}
+
+function handleEvent(name, data, assistant) {
+  if (name === "reasoning") {
+    assistant.reasoning = (assistant.reasoning || "") + (data.text || "");
+    if (!assistant._reasoningEl && liveBubble) {
+      const det = buildReasoning("", true);
+      assistant._reasoningEl = det.querySelector(".md");
+      liveBubble.insertBefore(det, assistant._body);
+    }
+    updateLive();
+  } else if (name === "delta") {
+    assistant.status = "";
+    if (liveStatus) { liveStatus.remove(); liveStatus = null; }
+    assistant.content += data.text || "";
+    updateLive();
+  } else if (name === "status") {
+    assistant.status = data.text || "";
+    if (liveStatus) liveStatus.textContent = assistant.status;
+    else if (liveBubble) {
+      liveStatus = document.createElement("div");
+      liveStatus.className = "status-line";
+      liveStatus.textContent = assistant.status;
+      liveBubble.prepend(liveStatus);
+    }
+  } else if (name === "sources") {
+    assistant.sources.push(...(data.items || []));
+    assistant.status = "已获取检索结果，正在整理答案…";
+    if (liveStatus) liveStatus.textContent = assistant.status;
+  } else if (name === "done") {
+    const u = data.usage || {};
+    if (u.prompt_tokens || u.completion_tokens) {
+      assistant.usage = `${u.prompt_tokens ?? "?"} 输入 / ${u.completion_tokens ?? "?"} 输出 tokens`;
+    }
+    if (data.sources?.length) assistant.sources = data.sources.map((s) => ({ ...s, url: s.url }));
+    assistant.status = "";
+  } else if (name === "error") {
+    assistant.error = true;
+    assistant.content = assistant.content
+      ? `${assistant.content}\n\n**出错：** ${data.text}`
+      : `出错：${data.text}`;
+    assistant.status = "";
+    if (liveStatus) { liveStatus.remove(); liveStatus = null; }
+    updateLive(true);
+  }
+}
+
+function stop() {
+  if (abortController) abortController.abort();
+}
+
+function autoGrow() {
+  inputEl.style.height = "auto";
+  inputEl.style.height = `${Math.min(inputEl.scrollHeight, 190)}px`;
+}
+
+inputEl.addEventListener("input", autoGrow);
+inputEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+    e.preventDefault();
+    send();
+  }
+});
+sendBtn.onclick = send;
+
+copyBtn.onclick = () => copyAndFlash(copyBtn, conversationText());
+
+searchToggle.onchange = savePrefs;
+thinkingToggle.onchange = savePrefs;
+
+/* ------------------------------------------------------------------ *
+ * Session sidebar
+ * ------------------------------------------------------------------ */
+
+const ICON_RENAME =
+  "M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04a1 1 0 0 0 0-1.41l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z";
+const ICON_DELETE = "M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM19 4h-3.5l-1-1h-5l-1 1H5v2h14V4z";
+
+function relTime(iso) {
+  const then = new Date(iso).getTime();
+  if (!then) return "";
+  const minutes = Math.floor((Date.now() - then) / 60000);
+  if (minutes < 1) return "刚刚";
+  if (minutes < 60) return `${minutes} 分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} 小时前`;
+  if (hours < 48) return "昨天";
+  const d = new Date(then);
+  const now = new Date();
+  return d.getFullYear() === now.getFullYear()
+    ? `${d.getMonth() + 1}月${d.getDate()}日`
+    : `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+async function refreshSessions() {
+  try {
+    const resp = await fetch("/api/sessions");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    sessions = (await resp.json()).sessions || [];
+  } catch {
+    // The conversation on screen is unaffected, so leave the list as it was
+    // rather than emptying it; a dead backend is already reported by the dot.
+    return;
+  }
+  renderSessions();
+}
+
+function sessionRow(s) {
+  const row = document.createElement("div");
+  row.className = "session";
+  row.dataset.id = s.id;
+  row.tabIndex = 0;
+  row.setAttribute("role", "button");
+  if (s.id === currentSessionId) row.classList.add("active");
+  row.title = `${s.title}\n${s.message_count} 条消息${s.model ? ` · ${s.model}` : ""}`;
+
+  const main = document.createElement("div");
+  main.className = "session-main";
+  const title = document.createElement("div");
+  title.className = "session-title";
+  title.textContent = s.title;
+  const meta = document.createElement("div");
+  meta.className = "session-meta";
+  meta.textContent = `${relTime(s.updated)} · ${s.message_count} 条`;
+  main.append(title, meta);
+
+  // Separate buttons rather than a double-click on the row: dblclick fires after
+  // two clicks, and the first one re-renders the list, destroying the very node
+  // the pending dblclick was aimed at.
+  const rename = iconButton("重命名", 14, ICON_RENAME);
+  rename.onclick = (e) => { e.stopPropagation(); renameSession(s); };
+  const del = iconButton("删除", 14, ICON_DELETE);
+  del.classList.add("danger");
+  del.onclick = (e) => { e.stopPropagation(); deleteSession(s); };
+
+  row.append(main, rename, del);
+  row.onclick = () => openSession(s.id);
+  row.onkeydown = (e) => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); openSession(s.id); }
+  };
+  return row;
+}
+
+function renderSessions() {
+  // Filtered here rather than on the server: the index already carries a digest of
+  // each conversation's text, so matching title and body is a local string search.
+  const needle = sessionSearch.value.trim().toLowerCase();
+  const shown = needle
+    ? sessions.filter((s) =>
+        `${s.title}\n${s.digest || ""}`.toLowerCase().includes(needle))
+    : sessions;
+
+  sessionListEl.replaceChildren();
+  if (!shown.length) {
+    const empty = document.createElement("div");
+    empty.className = "session-empty";
+    empty.textContent = needle ? "没有匹配的对话" : "还没有历史对话";
+    sessionListEl.append(empty);
+  }
+  for (const s of shown) sessionListEl.append(sessionRow(s));
+  // This just replaced every node syncControls annotated, so re-apply — the same
+  // reason renderAll ends the same way.
+  syncControls();
+}
+
+// Opening a conversation changes the selection, not the data, so renderSessions is
+// the wrong tool: rebuilding would also drop focus from a row opened with the
+// keyboard. The empty-state placeholder has no dataset.id and simply loses.
+function markActiveSession() {
+  for (const row of sessionListEl.children) {
+    row.classList.toggle("active", row.dataset.id === currentSessionId);
+  }
+}
+
+async function openSession(id) {
+  if (streaming || id === currentSessionId) return;
+  try {
+    const resp = await fetch(`/api/sessions/${id}`);
+    if (!resp.ok) {
+      const detail = (await resp.json().catch(() => ({}))).detail;
+      throw new Error(detail || `HTTP ${resp.status}`);
+    }
+    const body = await resp.json();
+    messages = (body.messages || []).map(fromStored);
+    currentSessionId = body.id;
+    // Set rather than left to the scroll listener: .chat is scroll-behavior:smooth,
+    // so restoring a long conversation animates and the listener would sample
+    // atBottom mid-flight and leave the view stuck at the top.
+    atBottom = true;
+    renderAll();
+    markActiveSession();
+    setSidebar(false);
+  } catch (err) {
+    alert(`打开对话失败：${err.message}`);
+    // Most likely a row whose file is gone; refetch so it drops out of the list.
+    await refreshSessions();
+  }
+}
+
+function newConversation() {
+  // stop() is fire-and-forget: send()'s finally still runs afterwards, but it
+  // saves the captured snapshot to the captured id, so this cannot corrupt it.
+  if (streaming) stop();
+  // Only an unsaved conversation needs a warning — a persisted one is still in the
+  // list, so there is nothing to lose and nothing to confirm.
+  if (!currentSessionId && messages.length && !confirm("当前对话还没有保存，确定放弃？")) return;
+  messages = [];
+  currentSessionId = null;
+  // The checkboxes are deliberately left alone: they are global preferences, so a
+  // new conversation starts the way the last one was left.
+  atBottom = true;
+  renderAll();
+  markActiveSession();
+}
+
+async function renameSession(s) {
+  if (streaming) return;
+  const answer = prompt("重命名对话", s.title);
+  if (answer === null) return;
+  const title = answer.trim();
+  if (!title || title === s.title) return;
+  try {
+    // Title only — a rename must not ship the conversation's images back.
+    const resp = await fetch(`/api/sessions/${s.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title }),
+    });
+    if (!resp.ok) {
+      const detail = (await resp.json().catch(() => ({}))).detail;
+      throw new Error(detail || `HTTP ${resp.status}`);
+    }
+    await refreshSessions();
+  } catch (err) {
+    alert(`重命名失败：${err.message}`);
+  }
+}
+
+async function deleteSession(s) {
+  if (streaming) return;
+  if (!confirm(`删除对话「${s.title}」？删除后无法恢复。`)) return;
+  try {
+    const resp = await fetch(`/api/sessions/${s.id}`, { method: "DELETE" });
+    if (!resp.ok) {
+      const detail = (await resp.json().catch(() => ({}))).detail;
+      throw new Error(detail || `HTTP ${resp.status}`);
+    }
+    if (currentSessionId === s.id) {
+      messages = [];
+      currentSessionId = null;
+      atBottom = true;
+      renderAll();
+    }
+    await refreshSessions();
+  } catch (err) {
+    alert(`删除失败：${err.message}`);
+  }
+}
+
+function setSidebar(open) {
+  sidebarEl.classList.toggle("open", open);
+  sidebarToggle.setAttribute("aria-expanded", String(open));
+}
+
+newChatBtn.onclick = newConversation;
+newBtn.onclick = newConversation;
+sidebarToggle.onclick = () => setSidebar(!sidebarEl.classList.contains("open"));
+sessionSearch.oninput = renderSessions;
+window.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  if (sessionSearch.value) { sessionSearch.value = ""; renderSessions(); }
+  else setSidebar(false);
+});
+
+/* One-time import of the single conversation the browser used to hold. The old key
+   also carried the two checkboxes, so those move to their own key on the way past. */
+async function migrateLegacyHistory() {
+  let saved;
+  try {
+    saved = JSON.parse(localStorage.getItem(LEGACY_KEY) || "null");
+  } catch {
+    saved = null;
+  }
+  if (!saved || typeof saved !== "object") return;
+
+  if (typeof saved.webSearch === "boolean" || typeof saved.thinking === "boolean") {
+    searchToggle.checked = Boolean(saved.webSearch);
+    thinkingToggle.checked = Boolean(saved.thinking);
+    savePrefs();
+  }
+
+  const legacy = Array.isArray(saved.messages) ? saved.messages : [];
+  if (!legacy.length) {
+    localStorage.removeItem(LEGACY_KEY);
+    return;
+  }
+  try {
+    const resp = await fetch("/api/sessions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      // The old store dropped images to stay inside the localStorage quota, so
+      // these arrive with the flag and no pixels; toStored preserves that.
+      body: JSON.stringify({
+        title: "导入的历史对话",
+        messages: legacy.map((m) => toStored({
+          role: m.role,
+          content: m.content || "",
+          images: [],
+          hadImages: Boolean(m.hadImages),
+          reasoning: m.reasoning || "",
+          sources: m.sources || [],
+          usage: m.usage || "",
+          error: Boolean(m.error),
+        })),
+      }),
+    });
+    if (!resp.ok) {
+      const detail = (await resp.json().catch(() => ({}))).detail;
+      throw new Error(detail || `HTTP ${resp.status}`);
+    }
+    // Removed only once the server has it: a failed import is retried on the next
+    // load rather than throwing away the only copy.
+    localStorage.removeItem(LEGACY_KEY);
+  } catch (err) {
+    alert(`导入浏览器里保存的旧对话失败，原数据已保留：${err.message}`);
+  }
+}
+
+async function bootSessions() {
+  await migrateLegacyHistory();
+  await refreshSessions();
+  // Reopen the most recent conversation, which is what a reload used to do.
+  if (sessions.length) await openSession(sessions[0].id);
+}
+
+/* ------------------------------------------------------------------ *
+ * Runtime status
+ * ------------------------------------------------------------------ */
+
+const STATE_CLASS = { ready: "dot-ready", external: "dot-ready", loading: "dot-loading",
+  starting: "dot-loading", switching: "dot-loading", error: "dot-error", stopped: "dot-error" };
+const STATE_TEXT = { ready: "运行中", external: "外部服务", loading: "加载模型中",
+  starting: "启动中", switching: "切换模型中", error: "不可用", stopped: "已停止" };
+
+/* Every disabled state is derived here and nowhere else — the 15s poll below would
+   otherwise revert whatever a one-off handler had set. */
+function syncControls() {
+  sendBtn.disabled = switching || runtimeState === "error";
+  copyBtn.disabled = !messages.length;
+  // Disabling the select while streaming is what avoids racing with stop(), which
+  // is fire-and-forget and leaves `streaming` set until send()'s finally runs.
+  modelSelect.disabled = streaming || switching || !canSwitch;
+  attachBtn.disabled = !vision;
+  attachBtn.title = vision ? "上传图片" : "当前模型不支持图片理解";
+  fileInput.disabled = !vision;
+  searchToggle.disabled = !tools;
+  searchLabel.title = tools ? SEARCH_TITLE : "当前模型不支持工具调用，联网检索不可用";
+  // inert, not disabled: disabled on a container still lets its children's click
+  // handlers fire, whereas inert blocks both pointer and keyboard. The search box
+  // sits outside the list precisely so filtering survives a stream.
+  // newChatBtn is left enabled on purpose — it calls stop() first.
+  newBtn.disabled = streaming;
+  sessionListEl.toggleAttribute("inert", streaming);
+}
+
+function applyVision(next) {
+  const had = vision;
+  vision = !!next;
+  if (had && !vision && pendingImages.length) {
+    pendingImages = [];
+    renderPreviews();
+    alert("当前模型不支持图片理解，已清空待发送的图片");
+  }
+  syncControls();
+}
+
+function applyTools(next) {
+  const had = tools;
+  tools = next !== false; // a missing field means "unknown" -> allow
+  if (!tools && searchToggle.checked) {
+    searchToggle.checked = false;
+    savePrefs(); // otherwise the next reload restores it ticked
+    // A tick restored from localStorage is not something the user just did, so
+    // only a real capability change speaks up.
+    if (had) alert("当前模型不支持工具调用，已关闭联网检索");
+  }
+  syncControls();
+}
+
+function applyStatus(s) {
+  runtimeState = s.state;
+  // The optimistic flag set on click outlives this line; a second tab learns
+  // about an in-flight switch from here instead.
+  switching = switching || s.state === "switching";
+  canSwitch = !!s.can_switch;
+  stateDot.className = `dot ${STATE_CLASS[s.state] || ""}`;
+  modelName.textContent = s.model || "未知模型";
+  const bits = [STATE_TEXT[s.state] || s.state, s.backend, `ctx ${s.n_ctx}`];
+  if (s.vision) bits.push("图片理解");
+  bits.push(s.tools === false ? "检索 不可用" : `检索 ${s.search_provider}`);
+  runtimeMeta.textContent = s.state === "error" ? s.detail.split("\n")[0] : bits.join(" · ");
+  runtimeMeta.title = s.detail || "";
+  applyVision(s.vision);
+  applyTools(s.tools);
+}
+
+async function refreshStatus() {
+  try {
+    const resp = await fetch("/api/status");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    applyStatus(await resp.json());
+    return runtimeState;
+  } catch {
+    runtimeState = "error";
+    stateDot.className = "dot dot-error";
+    runtimeMeta.textContent = "无法连接后端服务";
+    syncControls();
+    return "error";
+  }
+}
+
+async function pollUntilReady() {
+  const state = await refreshStatus();
+  if (state === "loading" || state === "starting" || state === "switching") {
+    setTimeout(pollUntilReady, 2000);
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * System telemetry
+ * ------------------------------------------------------------------ */
+
+const STATS_MS = 2000;
+// A 24 GB card running the 27B model sits near its ceiling by design, so these
+// mark "nothing else can coexist" and "about to fail", not merely "busy".
+const VRAM_WARN = 0.9;
+const VRAM_ERR = 0.96;
+
+function setStat(el, text, level) {
+  el.textContent = text;
+  el.className = level || "";
+}
+
+function applyStats(s) {
+  setStat(stCpu, s.cpu_percent == null ? "–" : `${s.cpu_percent}%`);
+  setStat(stRam, s.ram_total_gb == null ? "–" : `${s.ram_used_gb}/${s.ram_total_gb}G`);
+  if (!s.gpu_available) {
+    setStat(stGpu, "–");
+    setStat(stVram, "–");
+    setStat(stTemp, "–");
+    gpuStatWrap.title = tempStatWrap.title = "未检测到 NVIDIA 驱动，GPU 遥测不可用";
+    return;
+  }
+  gpuStatWrap.title = GPU_STAT_TITLE;
+  setStat(stGpu, s.gpu_percent == null ? "–" : `${s.gpu_percent}%`);
+  const fill = s.vram_total_gb ? s.vram_used_gb / s.vram_total_gb : 0;
+  setStat(
+    stVram,
+    s.vram_total_gb == null ? "–" : `${s.vram_used_gb}/${s.vram_total_gb}G`,
+    fill >= VRAM_ERR ? "err" : fill >= VRAM_WARN ? "warn" : ""
+  );
+  setStat(stTemp, s.gpu_temp_c == null ? "–" : `${s.gpu_temp_c}°C`);
+  tempStatWrap.title = s.gpu_watts == null
+    ? "GPU 芯片温度"
+    : `GPU 芯片温度 · 功耗 ${s.gpu_watts} W`;
+}
+
+async function refreshStats() {
+  try {
+    const resp = await fetch("/api/stats");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    applyStats(await resp.json());
+  } catch {
+    // Keep the last good numbers: one missed poll says nothing, and a dead
+    // backend is already reported by the status dot.
+  }
+}
+
+function pollStats() {
+  // A background tab would otherwise poll ~43k times a day for numbers nobody
+  // is looking at.
+  if (document.visibilityState === "visible") refreshStats();
+}
+
+/* ------------------------------------------------------------------ *
+ * Model picker
+ * ------------------------------------------------------------------ */
+
+function fmtSize(bytes) {
+  if (!bytes) return "?";
+  const units = ["B", "KB", "MB", "GB"];
+  let n = bytes;
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+  return `${n.toFixed(i >= 3 ? 1 : 0)} ${units[i]}`;
+}
+
+function option(value, text, title) {
+  const el = document.createElement("option");
+  el.value = value;
+  el.textContent = text;
+  if (title) el.title = title;
+  return el;
+}
+
+async function loadModels() {
+  try {
+    const resp = await fetch("/api/models");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    canSwitch = !!data.can_switch;
+    currentModelId = data.active || "";
+    const known = (data.models || []).some((m) => m.id === data.active);
+
+    const opts = [];
+    // .env may point outside the scanned directory; name that model rather than
+    // leaving the dropdown silently empty.
+    if (!known && data.active) opts.push(option("", `${data.active}（不在模型目录）`));
+    for (const m of data.models || []) {
+      opts.push(option(
+        m.id,
+        `${m.name} · ${fmtSize(m.size)}${m.vision ? " · 图片" : ""}`,
+        m.vision ? "支持图片理解" : "纯文本模型",
+      ));
+    }
+    modelSelect.replaceChildren(...opts);
+    modelSelect.value = known ? data.active : "";
+    modelSelect.title = canSwitch
+      ? `切换本地模型（${data.dir}），会重启 llama-server，当前对话保留`
+      : "外部 llama-server 模式下无法切换模型";
+  } catch {
+    canSwitch = false;
+    modelSelect.replaceChildren(option("", "模型列表不可用"));
+  }
+  syncControls();
+}
+
+async function switchModel(id) {
+  const prev = currentModelId;
+  if (!id || id === prev) { modelSelect.value = prev || ""; return; }
+  if (!confirm(`切换到 ${id}？\nllama-server 会重启，加载大模型可能需要一两分钟。\n当前对话会保留。`)) {
+    modelSelect.value = prev || "";
+    return;
+  }
+
+  switching = true;
+  syncControls();
+  stateDot.className = "dot dot-loading";
+  runtimeMeta.textContent = "切换模型中…";
+  // Started before the await so it runs concurrently with the pending POST: the
+  // topbar shows live llama-server progress (hover the meta line) while it loads.
+  pollUntilReady();
+
+  try {
+    const resp = await fetch("/api/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `HTTP ${resp.status}`);
+    currentModelId = id;
+    applyStatus(body);
+  } catch (err) {
+    alert(`切换失败：${err.message}`);
+    modelSelect.value = currentModelId;
+  } finally {
+    switching = false;
+    syncControls();
+    refreshStatus();
+    // Re-reads `active`, so the select snaps back by itself after a rollback.
+    loadModels();
+  }
+}
+
+modelSelect.onchange = () => switchModel(modelSelect.value);
+
+loadPrefs();
+renderAll();
+autoGrow();
+pollUntilReady();
+loadModels();
+bootSessions();
+setInterval(refreshStatus, 15000);
+refreshStats();
+setInterval(pollStats, STATS_MS);

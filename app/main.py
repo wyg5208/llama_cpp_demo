@@ -1,0 +1,343 @@
+from __future__ import annotations
+
+import json
+import logging
+import re
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, Literal
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field, field_validator
+from starlette.concurrency import run_in_threadpool
+from starlette.datastructures import MutableHeaders
+
+from . import history
+from .config import ROOT, Settings, get_settings
+from .llm import ChatMessage, stream_chat
+from .models import find_model, save_active_model, scan_models
+from .runtime import LlamaRuntime, RuntimeUnavailable
+from .sysstats import SystemStats
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
+log = logging.getLogger("app")
+
+DATA_URL_RE = re.compile(r"^data:image/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=\s]+$")
+MAX_IMAGE_BYTES = 12_000_000
+MAX_IMAGES_PER_MESSAGE = 4
+# The wire cap is the tighter one: llama-server pays for every message in prompt
+# tokens. The archive is looser so a long conversation keeps the turns the wire has
+# stopped sending instead of being silently truncated on disk.
+MAX_CHAT_MESSAGES = 200
+MAX_SESSION_MESSAGES = 400
+
+runtime: LlamaRuntime | None = None
+# Built once so the NVML handle stays open; re-initialising the driver per
+# request would be the expensive part of an otherwise free endpoint.
+stats = SystemStats()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    global runtime
+    settings = get_settings()
+    runtime = LlamaRuntime(settings)
+    try:
+        await runtime.start()
+        log.info("llama-server ready: %s", json.dumps(runtime.status(), ensure_ascii=False))
+    except RuntimeUnavailable as exc:
+        # Keep serving the UI so the browser can show what went wrong.
+        runtime.state = "error"
+        runtime.detail = str(exc)
+        log.error("%s", exc)
+    try:
+        yield
+    finally:
+        await runtime.stop()
+
+
+class RevalidateAssets:
+    """Send `Cache-Control: no-cache` with the document and the static assets.
+
+    StaticFiles emits Last-Modified and ETag but no Cache-Control, so Chrome
+    falls back to heuristic freshness — roughly 10% of the file's age. An app.js
+    cached a day ago therefore counts as fresh for hours, and any edit ships as
+    new HTML driving old JS. `no-cache` keeps the cheap 304s while forcing a
+    check on every load.
+
+    Hand-written ASGI rather than @app.middleware("http"): BaseHTTPMiddleware
+    buffers the response body, which would break the SSE stream on /api/chat.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        path = scope.get("path", "")
+        if scope["type"] != "http" or not (path == "/" or path.startswith("/static/")):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_header(message) -> None:
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["Cache-Control"] = "no-cache"
+            await send(message)
+
+        await self.app(scope, receive, send_with_header)
+
+
+app = FastAPI(title="llama.cpp 本地聊天", lifespan=lifespan)
+app.add_middleware(RevalidateAssets)
+
+
+class MessageIn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = ""
+    images: list[str] = Field(default_factory=list, max_length=MAX_IMAGES_PER_MESSAGE)
+
+    @field_validator("images")
+    @classmethod
+    def _check_images(cls, value: list[str]) -> list[str]:
+        for url in value:
+            if not DATA_URL_RE.match(url):
+                raise ValueError("图片必须是 png/jpeg/webp/gif 的 base64 data URL")
+            if len(url) > MAX_IMAGE_BYTES:
+                raise ValueError("单张图片过大（上限约 12MB）")
+        return value
+
+
+class ChatRequest(BaseModel):
+    messages: list[MessageIn] = Field(min_length=1, max_length=MAX_CHAT_MESSAGES)
+    web_search: bool = False
+    thinking: bool = False
+
+
+class ModelSwitchIn(BaseModel):
+    # An id from GET /api/models, never a path: nothing client-supplied is
+    # concatenated into the --model argument.
+    id: str = Field(min_length=1, max_length=200)
+
+
+class StoredSource(BaseModel):
+    index: int = 0
+    title: str = ""
+    # Restored sessions put this straight into an anchor href, so it becomes
+    # client-writable here for the first time: hold it to the same http(s) rule
+    # safeLink() applies to rendered markdown.
+    url: str = ""
+
+    @field_validator("url")
+    @classmethod
+    def _check_url(cls, value: str) -> str:
+        if value and not re.match(r"^https?://", value, re.I):
+            raise ValueError("来源链接必须是 http 或 https 地址")
+        return value
+
+
+class StoredMessage(MessageIn):
+    """An archived message: what goes to the model, plus what the UI reads back."""
+
+    reasoning: str = ""
+    sources: list[StoredSource] = Field(default_factory=list, max_length=50)
+    usage: str = ""
+    error: bool = False
+    # Stored, not derived from len(images) — a conversation migrated out of
+    # localStorage has the flag but not the pixels, and deriving it would erase the
+    # "images not saved" note the first time that session is re-saved.
+    had_images: bool = False
+
+
+class SessionCreate(BaseModel):
+    # Empty means "title it from the first user message".
+    title: str = Field(default="", max_length=120)
+    messages: list[StoredMessage] = Field(min_length=1, max_length=MAX_SESSION_MESSAGES)
+
+
+class SessionPatch(BaseModel):
+    """Partial by design: renaming from the sidebar must not ship the images back."""
+
+    title: str | None = Field(default=None, max_length=120)
+    messages: list[StoredMessage] | None = Field(default=None, max_length=MAX_SESSION_MESSAGES)
+
+
+def sse(event_type: str, data: dict) -> str:
+    return f"event: {event_type}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@app.get("/api/status")
+async def status() -> JSONResponse:
+    assert runtime is not None
+    return JSONResponse(runtime.status())
+
+
+@app.get("/api/stats")
+async def sys_stats() -> JSONResponse:
+    # Inline rather than offloaded to a thread pool: a full poll is ~0.2 ms, so
+    # the hop would cost more than the work. Fields are null, never absent, when
+    # a source is unavailable (no NVIDIA driver, non-Windows).
+    return JSONResponse(stats.read())
+
+
+@app.get("/api/models")
+async def list_models() -> JSONResponse:
+    assert runtime is not None
+    model_dir = get_settings().model_dir
+    return JSONResponse(
+        {
+            "dir": str(model_dir),
+            "active": runtime.model_path.stem,
+            "can_switch": runtime.can_switch,
+            "models": [e.to_dict() for e in scan_models(model_dir)],
+        }
+    )
+
+
+@app.post("/api/model")
+async def switch_model(req: ModelSwitchIn) -> JSONResponse:
+    assert runtime is not None
+    if not runtime.can_switch:
+        raise HTTPException(400, "外部 llama-server 模式下无法切换模型")
+    if runtime.state == "switching":
+        raise HTTPException(409, "正在切换模型，请稍候")
+    model_dir = get_settings().model_dir
+    entry = find_model(model_dir, req.id)
+    if entry is None:
+        raise HTTPException(404, f"模型不存在或已被移动：{req.id[:80]}")
+    try:
+        await runtime.switch_model(entry.model_path, entry.mmproj_path)
+    except RuntimeUnavailable as exc:
+        # 502: llama-server refused the new weights. The message says whether we
+        # rolled back, and carries the server log tail that explains why.
+        raise HTTPException(502, str(exc)[:1200]) from exc
+    save_active_model(get_settings().active_model_file, entry)
+    return JSONResponse(runtime.status())
+
+
+def _checked_session_id(session_id: str) -> str:
+    """Reject anything that is not an id minted by history.py, before it reaches a path."""
+    if not history.is_session_id(session_id):
+        # Logged because the browser should never send one, but answered as 404
+        # rather than 400 so the route does not distinguish malformed from missing.
+        log.warning("rejecting malformed session id: %r", session_id[:80])
+        raise HTTPException(404, "会话不存在")
+    return session_id
+
+
+@app.get("/api/sessions")
+async def sessions_index() -> JSONResponse:
+    # Through the thread pool even though the index is only a few KB: it takes the
+    # same lock as the writes, and waiting on that inline would stall the event
+    # loop for as long as a multi-megabyte session body takes to serialise.
+    sessions = await run_in_threadpool(history.list_sessions, get_settings().history_dir)
+    return JSONResponse({"sessions": sessions})
+
+
+@app.post("/api/sessions")
+async def session_create(req: SessionCreate) -> JSONResponse:
+    assert runtime is not None
+    try:
+        record = await run_in_threadpool(
+            history.create_session,
+            get_settings().history_dir,
+            [m.model_dump() for m in req.messages],
+            runtime.model_path.stem,
+            req.title,
+        )
+    except OSError as exc:
+        raise HTTPException(500, f"保存对话失败：{exc}") from exc
+    return JSONResponse(record)
+
+
+@app.get("/api/sessions/{session_id}")
+async def session_get(session_id: str) -> JSONResponse:
+    _checked_session_id(session_id)
+    body = await run_in_threadpool(history.read_session, get_settings().history_dir, session_id)
+    if body is None:
+        raise HTTPException(404, "会话不存在")
+    return JSONResponse(body)
+
+
+@app.patch("/api/sessions/{session_id}")
+async def session_patch(session_id: str, req: SessionPatch) -> JSONResponse:
+    _checked_session_id(session_id)
+    # Built by hand rather than with model_dump(exclude_unset=True), which would
+    # also drop unset defaults from the nested messages and archive them as absent.
+    patch: dict = {}
+    if req.title is not None:
+        patch["title"] = req.title
+    if req.messages is not None:
+        patch["messages"] = [m.model_dump() for m in req.messages]
+    if not patch:
+        raise HTTPException(400, "没有需要更新的内容")
+    try:
+        record = await run_in_threadpool(
+            history.update_session, get_settings().history_dir, session_id, patch
+        )
+    except OSError as exc:
+        raise HTTPException(500, f"保存对话失败：{exc}") from exc
+    if record is None:
+        raise HTTPException(404, "会话不存在")
+    return JSONResponse(record)
+
+
+@app.delete("/api/sessions/{session_id}")
+async def session_delete(session_id: str) -> JSONResponse:
+    _checked_session_id(session_id)
+    try:
+        deleted = await run_in_threadpool(
+            history.delete_session, get_settings().history_dir, session_id
+        )
+    except OSError as exc:
+        raise HTTPException(500, f"删除对话失败：{exc}") from exc
+    if not deleted:
+        raise HTTPException(404, "会话不存在")
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/chat")
+async def chat(req: ChatRequest) -> StreamingResponse:
+    assert runtime is not None
+    if runtime.state not in ("ready", "external"):
+        reason = (
+            "正在切换模型，请稍候"
+            if runtime.state == "switching"
+            else f"模型未就绪: {runtime.detail}"
+        )
+        return StreamingResponse(
+            iter([sse("error", {"text": reason})]),
+            media_type="text/event-stream",
+        )
+
+    history = [ChatMessage(role=m.role, content=m.content, images=m.images) for m in req.messages]
+
+    # Search is implemented as a tool call, so a model whose template cannot call
+    # tools cannot search. Clamping here rather than trusting the browser covers a
+    # second tab with stale state and any direct API call.
+    use_search = req.web_search and runtime.supports_tools
+    if req.web_search and not use_search:
+        log.warning("ignoring web_search: %s does not support tool calls", runtime.model_path.name)
+
+    async def events() -> AsyncIterator[str]:
+        try:
+            async for event in stream_chat(
+                get_settings(), history, use_search, req.thinking
+            ):
+                yield sse(event["type"], event)
+        except Exception as exc:  # noqa: BLE001 - surface any failure to the browser
+            log.exception("chat failed")
+            yield sse("error", {"text": f"{type(exc).__name__}: {exc}"})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
+
+
+@app.get("/")
+async def index() -> FileResponse:
+    return FileResponse(ROOT / "static" / "index.html")
