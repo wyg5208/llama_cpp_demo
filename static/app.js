@@ -153,6 +153,13 @@ let currentSessionId = null;
 let saveChain = Promise.resolve();
 let saveFailed = false;
 
+// Settings/About/Help dialog. modalOpen gates the drag handlers and the Escape
+// chain, which both predate it and would otherwise act on the page underneath.
+let modalOpen = false;
+let activePanel = "settings";
+let drawerWasOpen = false;
+let modalReturnFocus = null;
+
 const $ = (id) => document.getElementById(id);
 const messagesEl = $("messages");
 const emptyEl = $("empty");
@@ -185,6 +192,20 @@ const stTemp = $("st-temp");
 const gpuStatWrap = $("st-gpu-wrap");
 const tempStatWrap = $("st-temp-wrap");
 const GPU_STAT_TITLE = gpuStatWrap.title;
+
+const topbarEl = document.querySelector(".topbar");
+const workspaceEl = document.querySelector(".workspace");
+const modalEl = $("modal");
+const modalTitle = $("modal-title");
+const modalBackdrop = $("modal-backdrop");
+const modalCloseBtn = $("modal-close");
+const railBtns = [...document.querySelectorAll(".rail-btn")];
+const sideLinks = [...document.querySelectorAll(".side-link")];
+const settingsFieldsEl = $("settings-fields");
+const settingsMsgEl = $("settings-msg");
+const settingsSaveBtn = $("settings-save");
+const settingsResetBtn = $("settings-reset");
+const aboutFieldsEl = $("about-fields");
 
 function loadPrefs() {
   try {
@@ -596,7 +617,7 @@ fileInput.onchange = () => { addFiles(fileInput.files); fileInput.value = ""; };
 
 let dragDepth = 0;
 window.addEventListener("dragenter", (e) => {
-  if (!vision || ![...e.dataTransfer.types].includes("Files")) return;
+  if (modalOpen || !vision || ![...e.dataTransfer.types].includes("Files")) return;
   dragDepth++;
   dropOverlay.classList.add("active");
 });
@@ -610,7 +631,10 @@ window.addEventListener("drop", (e) => {
   e.preventDefault();
   dragDepth = 0;
   dropOverlay.classList.remove("active");
-  if (!vision) return;
+  // Gated as well as dragenter: the banner cannot appear while the dialog is open,
+  // but the drop still lands, and attaching to an invisible composer is worse than
+  // refusing. Same reason the preventDefault above stays unconditional.
+  if (modalOpen || !vision) return;
   if (e.dataTransfer.files.length) addFiles(e.dataTransfer.files);
 });
 
@@ -1005,6 +1029,9 @@ sidebarToggle.onclick = () => setSidebar(!sidebarEl.classList.contains("open"));
 sessionSearch.oninput = renderSessions;
 window.addEventListener("keydown", (e) => {
   if (e.key !== "Escape") return;
+  // First claim, and an early return: closing the dialog must not also clear the
+  // session filter or shut the drawer that is sitting behind it.
+  if (modalOpen) { closePanel(); return; }
   if (sessionSearch.value) { sessionSearch.value = ""; renderSessions(); }
   else setSidebar(false);
 });
@@ -1071,6 +1098,340 @@ async function bootSessions() {
 }
 
 /* ------------------------------------------------------------------ *
+ * Settings / About / Help dialog
+ * ------------------------------------------------------------------ */
+
+const PANEL_TITLE = { settings: "设置", about: "关于", help: "帮助" };
+
+/* Chinese label for every field Settings has. A field the backend adds without
+   this table being updated falls through to its raw name and still renders, so a
+   gap is visible rather than silently hiding a setting. */
+const FIELD_LABEL = {
+  runtime_backend: "推理后端",
+  llama_server_url: "外部 llama-server",
+  llama_port: "llama-server 端口",
+  n_gpu_layers: "GPU 层数",
+  // "默认" because models listed in n_ctx_overrides ignore this value; the number
+  // that is actually in force is on the 关于 panel.
+  n_ctx: "默认上下文长度",
+  n_ctx_overrides: "按模型上下文",
+  server_extra_args: "llama-server 附加参数",
+  server_startup_timeout: "启动超时（秒）",
+  model_path: "启动默认模型",
+  mmproj_path: "视觉投影文件",
+  system_prompt: "系统提示词",
+  temperature: "温度",
+  top_p: "核采样 top_p",
+  max_tokens: "回答 token 上限",
+  max_tool_rounds: "工具调用轮数上限",
+  enable_thinking: "默认开启深度思考",
+  thinking_max_tokens: "思考 token 上限",
+  search_provider: "检索源",
+  search_max_results: "检索结果条数",
+  bocha_api_key: "BOCHA 密钥",
+  tavily_api_key: "Tavily 密钥",
+  host: "监听地址",
+  port: "监听端口",
+};
+
+/* Only these eight get a control; everything else renders as text. The bounds
+   mirror SettingsPatch in app/settings_store.py — that model is what the server
+   enforces, so a wider range here would only buy a round trip that ends in 422. */
+const FIELD_WIDGET = {
+  system_prompt: { kind: "textarea" },
+  temperature: { kind: "number", step: 0.1, min: 0, max: 2 },
+  top_p: { kind: "number", step: 0.05, min: 0.01, max: 1 },
+  max_tokens: { kind: "number", step: 128, min: 64, max: 32768 },
+  thinking_max_tokens: { kind: "number", step: 128, min: 64, max: 32768 },
+  max_tool_rounds: { kind: "number", step: 1, min: 0, max: 8 },
+  search_provider: { kind: "select", options: ["auto", "bing", "bocha", "tavily"] },
+  search_max_results: { kind: "number", step: 1, min: 1, max: 10 },
+};
+
+function say(text, kind) {
+  settingsMsgEl.textContent = text;
+  settingsMsgEl.className = kind ? `panel-msg ${kind}` : "panel-msg";
+}
+
+function fieldRow(f) {
+  const row = document.createElement("div");
+  row.className = "field";
+  row.dataset.name = f.name;
+  row.classList.toggle("overridden", Boolean(f.overridden));
+
+  const name = document.createElement("div");
+  name.className = "field-name";
+  const label = document.createElement("div");
+  label.textContent = FIELD_LABEL[f.name] || f.name;
+  const key = document.createElement("code");
+  key.textContent = f.name;
+  name.append(label, key);
+
+  const body = document.createElement("div");
+  body.className = "field-body";
+  const widget = f.editable ? FIELD_WIDGET[f.name] : null;
+
+  if (!widget) {
+    const value = document.createElement("div");
+    value.className = "field-value";
+    value.textContent = String(f.value);
+    body.append(value);
+  } else if (widget.kind === "textarea") {
+    const ta = document.createElement("textarea");
+    ta.className = "field-textarea";
+    ta.value = f.value;
+    body.append(ta);
+  } else if (widget.kind === "select") {
+    const sel = document.createElement("select");
+    sel.className = "field-select";
+    for (const opt of widget.options) sel.append(option(opt, opt));
+    sel.value = f.value;
+    body.append(sel);
+  } else {
+    const inp = document.createElement("input");
+    inp.className = "field-input";
+    inp.type = "number";
+    inp.step = widget.step;
+    inp.min = widget.min;
+    inp.max = widget.max;
+    inp.value = f.value;
+    body.append(inp);
+  }
+
+  // Baseline for the diff in collectPatch, so saving one change does not write all
+  // eight and stripe the whole panel as overridden.
+  if (widget) row.dataset.base = String(f.value);
+
+  const note = document.createElement("div");
+  note.className = "field-reason";
+  note.textContent = f.editable
+    ? (f.overridden ? "已覆盖 .env 中的值" : "")
+    : f.reason;
+  if (note.textContent) body.append(note);
+
+  row.append(name, body);
+  return row;
+}
+
+function renderSettings(data) {
+  settingsFieldsEl.replaceChildren(...(data.fields || []).map(fieldRow));
+  settingsResetBtn.disabled = !(data.overridden || []).length;
+  settingsResetBtn.title = (data.overridden || []).length
+    ? `删除 runtime/settings_override.json，丢弃已覆盖的 ${data.overridden.length} 项`
+    : "当前没有覆盖任何 .env 中的值";
+}
+
+async function loadSettings() {
+  say("");
+  try {
+    const resp = await fetch("/api/settings");
+    if (!resp.ok) {
+      const detail = (await resp.json().catch(() => ({}))).detail;
+      throw new Error(detail || `HTTP ${resp.status}`);
+    }
+    renderSettings(await resp.json());
+  } catch (err) {
+    settingsFieldsEl.replaceChildren();
+    say(`读取设置失败：${err.message}`, "err");
+  }
+}
+
+/* Returns only the fields whose control differs from what the server sent, plus
+   the labels of any control holding an impossible value. */
+function collectPatch() {
+  const patch = {};
+  const bad = [];
+  for (const row of settingsFieldsEl.children) {
+    const name = row.dataset.name;
+    const widget = FIELD_WIDGET[name];
+    if (!widget) continue;
+    const control = row.querySelector(".field-input, .field-textarea, .field-select");
+    if (!control) continue;
+    row.classList.remove("invalid");
+
+    let value;
+    if (widget.kind === "number") {
+      // valueAsNumber, never Number(control.value): a cleared number input reports
+      // "", which Number() turns into 0 — and 0 is a perfectly legal temperature,
+      // so the server would accept it. This is the only place that can catch it.
+      value = control.valueAsNumber;
+      if (!Number.isFinite(value) || value < widget.min || value > widget.max) {
+        row.classList.add("invalid");
+        bad.push(FIELD_LABEL[name] || name);
+        continue;
+      }
+    } else {
+      value = control.value;
+      if (widget.kind === "textarea" && !value.trim()) {
+        row.classList.add("invalid");
+        bad.push(FIELD_LABEL[name] || name);
+        continue;
+      }
+    }
+    if (String(value) !== row.dataset.base) patch[name] = value;
+  }
+  return { patch, bad };
+}
+
+async function saveSettings() {
+  const { patch, bad } = collectPatch();
+  if (bad.length) { say(`取值不合法：${bad.join("、")}`, "err"); return; }
+  if (!Object.keys(patch).length) { say("没有改动", "warn"); return; }
+  settingsSaveBtn.disabled = true;
+  try {
+    const resp = await fetch("/api/settings", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `HTTP ${resp.status}`);
+    renderSettings(body);
+    say(
+      body.persisted
+        ? "已保存，对下一条消息生效"
+        : "已生效，但没能写入磁盘，重启后会丢失",
+      body.persisted ? "ok" : "warn"
+    );
+    // search_provider shows in the topbar's meta line, so read it back rather than
+    // waiting up to 15s for the next poll.
+    refreshStatus();
+  } catch (err) {
+    say(`保存失败：${err.message}`, "err");
+  } finally {
+    syncControls();
+  }
+}
+
+async function resetSettings() {
+  if (!confirm("删除 runtime/settings_override.json，全部恢复为 .env 中的值？")) return;
+  settingsResetBtn.disabled = true;
+  try {
+    const resp = await fetch("/api/settings", { method: "DELETE" });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(body.detail || `HTTP ${resp.status}`);
+    renderSettings(body);
+    say(
+      body.persisted ? "已恢复 .env 中的值" : "内存中已恢复，但磁盘上的文件删不掉",
+      body.persisted ? "ok" : "warn"
+    );
+    refreshStatus();
+  } catch (err) {
+    say(`恢复失败：${err.message}`, "err");
+  } finally {
+    syncControls();
+  }
+}
+
+function aboutRow(label, text) {
+  const row = document.createElement("div");
+  row.className = "field";
+  const name = document.createElement("div");
+  name.className = "field-name";
+  const span = document.createElement("div");
+  span.textContent = label;
+  name.append(span);
+  const body = document.createElement("div");
+  body.className = "field-body";
+  const value = document.createElement("div");
+  value.className = "field-value";
+  value.textContent = text;
+  body.append(value);
+  row.append(name, body);
+  return row;
+}
+
+/* Refetched on every open rather than cached: session count, model size and the
+   runtime state all move while the app runs, and a stale "关于" is worse than
+   one extra request. */
+async function loadAbout() {
+  aboutFieldsEl.replaceChildren();
+  let a;
+  try {
+    const resp = await fetch("/api/about");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    a = await resp.json();
+  } catch (err) {
+    aboutFieldsEl.replaceChildren(aboutRow("错误", `读取失败：${err.message}`));
+    return;
+  }
+  const r = a.runtime || {};
+  const s = a.sessions || {};
+  const caps = [];
+  if (r.vision) caps.push("图片理解");
+  if (r.tools !== false) caps.push("工具调用 / 联网检索");
+  const rows = [
+    ["运行状态", `${STATE_TEXT[r.state] || r.state || "–"}${r.detail ? ` — ${String(r.detail).split("\n")[0]}` : ""}`],
+    ["推理后端", `${r.backend || "–"}${a.external ? "（外部 llama-server，不由本应用启动）" : ""}`],
+    ["服务地址", r.base_url || "–"],
+    ["llama.cpp 版本", a.build_info || "未知（外部服务未提供）"],
+    ["当前模型", r.model || "–"],
+    ["模型文件", a.model_size_gb ? `${a.model_path} · ${a.model_size_gb} GB` : a.model_path || "–"],
+    ["视觉投影", a.mmproj_path || (r.vision ? "–" : "无（不支持图片理解）")],
+    ["上下文长度", `${r.n_ctx ?? "–"} tokens`],
+    ["GPU 层数", String(r.n_gpu_layers ?? "–")],
+    ["模型能力", caps.join(" · ") || "纯文本对话"],
+    ["检索源", r.search_provider || "–"],
+    ["历史对话", s.readable === false
+      ? "目录不可读"
+      : `${s.count ?? 0} 个 · ${fmtSize(s.bytes || 0)} · runtime/history/`],
+  ];
+  aboutFieldsEl.replaceChildren(...rows.map(([k, v]) => aboutRow(k, v)));
+}
+
+function setPanel(name) {
+  activePanel = PANEL_TITLE[name] ? name : "settings";
+  modalTitle.textContent = PANEL_TITLE[activePanel];
+  for (const btn of railBtns) btn.classList.toggle("active", btn.dataset.panel === activePanel);
+  for (const id of Object.keys(PANEL_TITLE)) {
+    $(`panel-${id}`).classList.toggle("active", id === activePanel);
+  }
+  if (activePanel === "settings") loadSettings();
+  else if (activePanel === "about") loadAbout();
+}
+
+/* inert on the two containers is the whole focus trap — no hand-written Tab cycle
+   — and it also blocks the topbar and the conversation behind the dialog. It does
+   not stop the 2s telemetry poll, the 15s status poll or a running stream, which
+   is the point: opening the panel costs nothing that is in flight. The trade is
+   that 停止 becomes unreachable until the panel is closed, which is why Escape and
+   a backdrop click both close it. The dialog is the last thing in <body> for the
+   same reason. */
+function openPanel(name, trigger) {
+  if (modalOpen) { setPanel(name); return; }
+  modalOpen = true;
+  modalReturnFocus = trigger || null;
+  topbarEl.toggleAttribute("inert", true);
+  workspaceEl.toggleAttribute("inert", true);
+  modalEl.classList.add("active");
+  // An open drawer would sit under the backdrop with no way back to it.
+  drawerWasOpen = sidebarEl.classList.contains("open");
+  if (drawerWasOpen) setSidebar(false);
+  setPanel(name);
+  modalCloseBtn.focus();
+}
+
+function closePanel() {
+  if (!modalOpen) return;
+  modalOpen = false;
+  modalEl.classList.remove("active");
+  // inert comes off first: focus() inside an inert subtree is a no-op, so the
+  // opposite order drops focus to <body> and the next Tab starts over at the top.
+  topbarEl.removeAttribute("inert");
+  workspaceEl.removeAttribute("inert");
+  if (drawerWasOpen) setSidebar(true);
+  (modalReturnFocus || sidebarToggle).focus();
+  modalReturnFocus = null;
+}
+
+for (const btn of sideLinks) btn.onclick = () => openPanel(btn.dataset.panel, btn);
+for (const btn of railBtns) btn.onclick = () => setPanel(btn.dataset.panel);
+modalCloseBtn.onclick = closePanel;
+modalBackdrop.onclick = closePanel;
+settingsSaveBtn.onclick = saveSettings;
+settingsResetBtn.onclick = resetSettings;
+
+/* ------------------------------------------------------------------ *
  * Runtime status
  * ------------------------------------------------------------------ */
 
@@ -1098,6 +1459,10 @@ function syncControls() {
   // newChatBtn is left enabled on purpose — it calls stop() first.
   newBtn.disabled = streaming;
   sessionListEl.toggleAttribute("inert", streaming);
+  // Only the save button, not the sidebar entries that open the dialog: reading
+  // the help text mid-stream costs nothing, whereas saving would really change the
+  // turn in flight — llm.py re-reads get_settings() on every tool round.
+  settingsSaveBtn.disabled = streaming;
 }
 
 function applyVision(next) {

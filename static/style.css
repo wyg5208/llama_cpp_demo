@@ -106,6 +106,21 @@ body {
 .select:hover:not(:disabled) { border-color: var(--accent); }
 .select:disabled { opacity: 0.45; cursor: not-allowed; }
 
+/* ---------- form controls (settings panel) ---------- */
+.field-input, .field-textarea, .field-select {
+  width: 100%; padding: 6px 9px;
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 8px;
+  font: inherit; font-size: 13px; outline: none;
+  transition: border-color 0.15s;
+}
+.field-input:focus, .field-textarea:focus, .field-select:focus { border-color: var(--accent); }
+.field-input:disabled, .field-textarea:disabled, .field-select:disabled { opacity: 0.45; cursor: not-allowed; }
+.field-textarea { resize: vertical; min-height: 88px; line-height: 1.6; }
+/* A number input the user emptied is 0, not blank, and 0 is a legal temperature —
+   so the only signal that something is wrong has to be the border. */
+.field.invalid .field-input, .field.invalid .field-textarea { border-color: var(--err); }
+
 /* ---------- system telemetry ---------- */
 .sys-stats {
   display: flex;
@@ -166,6 +181,20 @@ body {
 .session:hover .msg-copy, .session .msg-copy:focus-visible { opacity: 0.45; }
 .session .msg-copy:hover { opacity: 1; }
 .session .msg-copy.danger:hover { color: var(--err); }
+
+/* Pinned under the list rather than inside it: .session-list owns the scroll, so
+   these three stay reachable however long the history gets. */
+.sidebar-foot { flex: 0 0 auto; display: flex; gap: 2px; padding: 8px 10px; border-top: 1px solid var(--border); }
+.side-link {
+  flex: 1 1 0; min-width: 0;
+  display: inline-flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 6px 2px; border: none; border-radius: 8px;
+  background: none; color: var(--muted); font: inherit; font-size: 11.5px;
+  cursor: pointer; transition: background 0.15s, color 0.15s;
+}
+.side-link span { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.side-link:hover { background: var(--panel-2); color: var(--text); }
+.side-link:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
 
 .sidebar-toggle { display: none; }
 
@@ -348,14 +377,87 @@ body {
 }
 .drop-overlay.active { display: flex; }
 
-/* The topbar has to fit a brand block, the meter and five controls. Drop the
+/* ---------- modal (settings / about / help) ---------- */
+/* Shown by a class, not the hidden attribute: any display rule beats
+   [hidden]{display:none}, so hidden would silently fail here. */
+.modal {
+  position: fixed; inset: 0; z-index: 60; padding: 20px;
+  display: none; align-items: center; justify-content: center;
+}
+.modal.active { display: flex; }
+.modal-backdrop { position: absolute; inset: 0; background: rgba(10, 12, 15, 0.62); }
+.modal-panel {
+  position: relative; display: flex; flex-direction: column; min-height: 0;
+  width: min(760px, 94vw); max-height: min(86vh, 720px);
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.5);
+}
+.modal-head {
+  flex: 0 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 13px 16px; border-bottom: 1px solid var(--border);
+}
+.modal-head h2 { margin: 0; font-size: 15px; font-weight: 600; }
+/* Same nested-flex rule as .workspace: without min-height 0 on both levels the
+   pane grows to fit its content instead of scrolling. */
+.modal-body { flex: 1 1 auto; display: flex; min-height: 0; }
+.modal-rail {
+  flex: 0 0 auto; display: flex; flex-direction: column; gap: 2px;
+  padding: 10px; border-right: 1px solid var(--border);
+}
+.rail-btn {
+  padding: 7px 12px; border: none; border-radius: 8px; background: none;
+  color: var(--muted); font: inherit; font-size: 13px; text-align: left;
+  cursor: pointer; white-space: nowrap; transition: background 0.15s, color 0.15s;
+}
+.rail-btn:hover { background: var(--panel-2); color: var(--text); }
+.rail-btn.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.rail-btn:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+.modal-pane { flex: 1 1 auto; min-width: 0; min-height: 0; overflow-y: auto; padding: 14px 16px 18px; }
+.panel { display: none; }
+.panel.active { display: block; }
+
+.panel-note { margin: 0 0 12px; font-size: 12.5px; line-height: 1.65; }
+.panel-note code, .field-name code, #panel-help code {
+  font-family: ui-monospace, Consolas, "Courier New", monospace; font-size: 11.5px;
+  background: var(--panel-2); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px;
+}
+.panel-msg { margin: 12px 0 0; font-size: 12.5px; min-height: 1.2em; }
+.panel-msg.ok { color: var(--ok); }
+.panel-msg.warn { color: var(--warn); }
+.panel-msg.err { color: var(--err); }
+.panel-actions { display: flex; gap: 8px; margin-top: 16px; padding-top: 13px; border-top: 1px solid var(--border); }
+
+.field-list { display: flex; flex-direction: column; gap: 1px; }
+.field {
+  display: grid; grid-template-columns: minmax(0, 17ch) minmax(0, 1fr);
+  gap: 4px 12px; align-items: baseline;
+  padding: 8px 10px; border-radius: 9px; border-left: 2px solid transparent;
+}
+.field:hover { background: rgba(255, 255, 255, 0.025); }
+/* The accent stripe is the only marker that a value came from the override file
+   rather than .env, so it has to survive the hover wash. */
+.field.overridden { border-left-color: var(--accent); }
+.field-name { font-size: 13px; overflow-wrap: anywhere; }
+.field-body { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.field-value { font-size: 13px; color: var(--muted); overflow-wrap: anywhere; white-space: pre-wrap; }
+.field-reason { font-size: 11.5px; color: var(--muted); opacity: 0.75; }
+
+#panel-help h3 { margin: 18px 0 6px; font-size: 13.5px; font-weight: 600; }
+#panel-help h3:first-child { margin-top: 0; }
+#panel-help p { margin: 0; font-size: 13px; line-height: 1.75; color: var(--muted); }
+
+/* Layer inventory: sidebar drawer 40 < drop overlay 50 < modal 60. The dialog
+   sits above the drop banner on purpose — dragging a file over an open panel must
+   not paint "release to attach" on top of it, and the drag handlers are gated on
+   the modal being closed.
+   The topbar has to fit a brand block, the meter and five controls. Drop the
    least actionable reading first, then the whole meter, rather than letting it
    clip mid-number against the buttons.
    The same width turns the sidebar into a drawer: there is no room for a 264px
    column beside a conversation. It slides over the chat rather than being hidden,
    because hiding it would make the history unreachable. Absolute inside the
    relatively positioned .workspace, so the topbar toggle stays clickable and no
-   backdrop is needed. z-index stays under the drop overlay's 50. */
+   backdrop is needed. */
 @media (max-width: 1080px) {
   .stat-optional { display: none; }
   .sidebar-toggle { display: inline-flex; }
@@ -366,6 +468,18 @@ body {
     box-shadow: 0 0 24px rgba(0, 0, 0, 0.45);
   }
   .sidebar.open { transform: none; }
+
+  /* Full bleed with the rail laid across the top: a vertical rail beside a
+     conversation would leave the fields no width to render in. */
+  .modal { padding: 0; }
+  .modal-panel { width: 100vw; max-height: 100vh; border: none; border-radius: 0; }
+  .modal-body { flex-direction: column; }
+  .modal-rail {
+    flex-direction: row; padding: 8px; overflow-x: auto;
+    border-right: none; border-bottom: 1px solid var(--border);
+  }
+  .rail-btn { text-align: center; }
+  .field { grid-template-columns: minmax(0, 1fr); gap: 5px; }
 }
 @media (max-width: 760px) { .sys-stats { display: none; } }
 

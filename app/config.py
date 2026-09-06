@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import logging
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from .settings_store import read_overrides
+
+log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -127,6 +132,11 @@ class Settings(BaseSettings):
         return ROOT / "runtime" / "active_model.json"
 
     @property
+    def settings_override_file(self) -> Path:
+        """Settings the panel changed at runtime. Wins over .env; delete to reset."""
+        return ROOT / "runtime" / "settings_override.json"
+
+    @property
     def history_dir(self) -> Path:
         """Chat sessions: one index plus one JSON file per conversation."""
         return ROOT / "runtime" / "history"
@@ -151,4 +161,24 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    """Settings from .env with runtime/settings_override.json layered on top.
+
+    Never call cache_clear() on this. LlamaRuntime keeps the returned instance
+    (runtime.py:28) and builds every llama-server argument through it, so a
+    second Settings would silently desync the runtime from /api/status and from
+    the browser. Resetting means setattr back to a fresh Settings' values, which
+    is what DELETE /api/settings does.
+    """
+    base = Settings()
+    overrides = read_overrides(base.settings_override_file)
+    if not overrides:
+        return base
+    try:
+        return Settings(**overrides)
+    except ValueError as exc:
+        # read_overrides already validated these through SettingsPatch, so this
+        # needs a hand-edited file that satisfies the patch model but not
+        # Settings. Falling back keeps the app bootable: an override file is
+        # subordinate to .env, so .env cannot be the thing that repairs it.
+        log.warning("ignoring settings override that failed to apply: %s", exc)
+        return base

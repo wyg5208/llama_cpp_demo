@@ -4,6 +4,7 @@ import json
 import logging
 import re
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, HTTPException
@@ -18,6 +19,14 @@ from .config import ROOT, Settings, get_settings
 from .llm import ChatMessage, stream_chat
 from .models import find_model, save_active_model, scan_models
 from .runtime import LlamaRuntime, RuntimeUnavailable
+from .settings_store import (
+    EDITABLE,
+    SettingsPatch,
+    clear_overrides,
+    describe,
+    merge_overrides,
+    read_overrides,
+)
 from .sysstats import SystemStats
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
@@ -212,6 +221,102 @@ async def switch_model(req: ModelSwitchIn) -> JSONResponse:
         raise HTTPException(502, str(exc)[:1200]) from exc
     save_active_model(get_settings().active_model_file, entry)
     return JSONResponse(runtime.status())
+
+
+@app.get("/api/settings")
+async def settings_get() -> JSONResponse:
+    s = get_settings()
+    return JSONResponse(describe(s, read_overrides(s.settings_override_file)))
+
+
+@app.patch("/api/settings")
+async def settings_patch(req: SettingsPatch) -> JSONResponse:
+    # Await-free on purpose, and the file write stays inline for the same reason:
+    # asyncio only hands control to another coroutine at an await, so this runs
+    # to completion before a live stream_chat can read a half-applied set of
+    # values. Offloading a few hundred bytes to the thread pool would trade that
+    # guarantee for nothing.
+    #
+    # exclude_none rather than exclude_unset: {"temperature": null} is unset-or-
+    # null indistinguishable from "leave it alone", and writing null through
+    # setattr would put None where llm.py expects a float.
+    patch = req.model_dump(exclude_none=True)
+    if not patch:
+        raise HTTPException(400, "没有需要更新的内容")
+    s = get_settings()
+    for name, value in patch.items():
+        # Settings is not frozen and /api/chat calls get_settings() per request,
+        # so this is live from the next message onwards. SettingsPatch is the
+        # only validation: setattr does not coerce or range-check.
+        setattr(s, name, value)
+    persisted = merge_overrides(s.settings_override_file, patch)
+    body = describe(s, read_overrides(s.settings_override_file))
+    # False means a read-only runtime/: the change is live but will not survive a
+    # restart, and the browser says so rather than showing a silent lie.
+    body["persisted"] = persisted
+    return JSONResponse(body)
+
+
+@app.delete("/api/settings")
+async def settings_reset() -> JSONResponse:
+    s = get_settings()
+    # Not get_settings.cache_clear(): LlamaRuntime stored this exact instance
+    # (runtime.py:28) and builds every llama-server argument through it, so a
+    # second Settings would desync the runtime from what the browser shows.
+    # Copying a fresh one's values back keeps a single authoritative object.
+    fresh = Settings()
+    for name in EDITABLE:
+        setattr(s, name, getattr(fresh, name))
+    cleared = clear_overrides(s.settings_override_file)
+    body = describe(s, read_overrides(s.settings_override_file))
+    body["persisted"] = cleared
+    return JSONResponse(body)
+
+
+def _history_stats(directory: Path) -> dict:
+    """Sessions on disk, counted with a plain stat walk.
+
+    Deliberately not history.list_sessions(): that prunes index.json when a body
+    file is missing, so reading it from here would make merely opening the About
+    panel mutate the session store.
+    """
+    count = 0
+    total = 0
+    try:
+        for entry in directory.iterdir():
+            # is_session_id also rejects the *.json.tmp of an interrupted write.
+            if entry.suffix == ".json" and history.is_session_id(entry.stem) and entry.is_file():
+                count += 1
+                total += entry.stat().st_size
+    except OSError:
+        return {"count": 0, "bytes": 0, "readable": False}
+    return {"count": count, "bytes": total, "readable": True}
+
+
+@app.get("/api/about")
+async def about() -> JSONResponse:
+    assert runtime is not None
+    s = get_settings()
+    model = runtime.model_path
+    try:
+        model_bytes = model.stat().st_size
+    except OSError:
+        model_bytes = 0
+    sessions = await run_in_threadpool(_history_stats, s.history_dir)
+    # build_info comes from the /props payload the runtime already fetched, so
+    # there is no subprocess: `llama-server --version` writes to stderr and the
+    # executable is not necessarily ours to run in external mode.
+    return JSONResponse(
+        {
+            "runtime": runtime.status(),
+            "build_info": str(runtime.props.get("build_info") or ""),
+            "external": s.uses_external_server,
+            "model_path": str(model),
+            "model_size_gb": round(model_bytes / 1024**3, 2),
+            "mmproj_path": str(runtime.mmproj_path) if runtime.mmproj_path else "",
+            "sessions": sessions,
+        }
+    )
 
 
 def _checked_session_id(session_id: str) -> str:
