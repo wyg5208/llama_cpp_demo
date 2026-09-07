@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import AsyncIterator, Literal
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
@@ -24,6 +24,13 @@ from .documents import (
     check_filename,
     fit_budget,
     parse_document,
+)
+from .export import (
+    MAX_EXPORT_BLOCKS,
+    MAX_EXPORT_HTML_CHARS,
+    ExportError,
+    build as build_export,
+    check_blocks,
 )
 from .llm import ChatMessage, stream_chat
 from .models import find_model, save_active_model, scan_models
@@ -196,6 +203,32 @@ class SessionPatch(BaseModel):
 
     title: str | None = Field(default=None, max_length=120)
     messages: list[StoredMessage] | None = Field(default=None, max_length=MAX_SESSION_MESSAGES)
+
+
+class ExportIn(BaseModel):
+    """One export's worth of already-rendered HTML.
+
+    A list of blocks rather than one HTML string, because the browser has the DOM
+    and this side does not: renderMarkdown's output is a flat sequence of top-level
+    blocks, so `el.children` already IS the block list, and re-deriving it here
+    would mean parsing the HTML straight back into a tree. The PDF packer needs
+    those boundaries to paginate. Splitting them server-side was tried and does not
+    work — a regex splitter returned 6 blocks for 7 with every offset shifted one
+    tag, and html.parser's getpos() is a line/column pair, not a byte offset.
+
+    Only pdf and docx arrive here. md, html and csv never leave the browser: it
+    already holds the markdown source and the rendered DOM, so those three cost no
+    round trip at all.
+    """
+
+    # A Literal so an unknown format is Pydantic's 422 before the handler runs;
+    # the route needs no dispatch table of its own.
+    format: Literal["pdf", "docx"]
+    blocks: list[str] = Field(min_length=1, max_length=MAX_EXPORT_BLOCKS)
+    # Decorative only: PDF document metadata. The filename belongs to the browser,
+    # which is why the endpoint returns bare bytes and there is no
+    # Content-Disposition and no RFC 5987 encoding anywhere in this file.
+    title: str = Field(default="", max_length=120)
 
 
 def sse(event_type: str, data: dict) -> str:
@@ -459,6 +492,47 @@ async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
         log.exception("document parse failed: %s", name[:200])
         raise HTTPException(500, f"解析失败：{type(exc).__name__}") from exc
     return JSONResponse(parsed.to_dict())
+
+
+@app.post("/api/export")
+async def export_file(req: ExportIn) -> Response:
+    """Render already-produced HTML into a PDF or a DOCX. Never calls the model."""
+    try:
+        # Field(max_length=...) above already bounds this, and it is re-checked here
+        # anyway for the same reason _is_sendable below re-checks the browser: a
+        # Pydantic violation is a 422 with an English body, while every other
+        # refusal in this app speaks Chinese.
+        #
+        # Note what is NOT here: /api/documents needs its manual mid-read 413
+        # because it streams an UploadFile in chunks and must stop early. This
+        # endpoint receives a JSON body Pydantic has already sized, so the limit is
+        # declarative and there is nothing to abort.
+        if sum(len(b) for b in req.blocks) > MAX_EXPORT_HTML_CHARS:
+            raise ExportError(f"导出内容超过 {MAX_EXPORT_HTML_CHARS // 1000}k 字符上限。")
+        blocks = check_blocks(req.blocks)
+        # Off the event loop: both writers are blocking CPU work, and the PDF one
+        # costs a 17 ms fit probe per guess (measured 300 blocks -> 0.58 s).
+        out = await run_in_threadpool(build_export, req.format, blocks, req.title)
+    except ExportError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - only the type reaches the browser
+        log.exception("export failed: %s", req.format)
+        raise HTTPException(500, f"导出失败：{type(exc).__name__}") from exc
+    # Bare bytes, not a Content-Disposition download: the browser already needs a
+    # Blob and an <a download> for md/html/csv, so one saveBlob() serves all five
+    # formats instead of two download paths that could drift, and the Chinese
+    # session title never has to survive RFC 5987 encoding.
+    #
+    # Headers stay ASCII because Starlette encodes them as latin-1 — the truncation
+    # warning is a flag the client words itself, not a sentence sent over the wire.
+    return Response(
+        content=out.data,
+        media_type=out.media_type,
+        headers={
+            "X-Export-Pages": str(out.pages),
+            "X-Export-Truncated": "1" if out.truncated else "0",
+        },
+    )
 
 
 def _is_sendable(m: MessageIn) -> bool:

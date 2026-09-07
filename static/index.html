@@ -45,6 +45,12 @@
         <path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
       </svg>
     </button>
+    <button id="export-btn" class="btn btn-ghost btn-icon" type="button"
+            title="把整段对话导出成文件" aria-label="把整段对话导出成文件">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path fill="currentColor" d="M10 3h4v8h4l-6 7-6-7h4V3zM5 20h14v2H5v-2z"/>
+      </svg>
+    </button>
     <button id="new-chat-btn" class="btn btn-ghost" type="button"
             title="开始一段新对话，当前对话会保留在左侧列表">新建对话</button>
   </div>
@@ -80,6 +86,12 @@
         </svg>
         <span>帮助</span>
       </button>
+      <button class="side-link" type="button" data-panel="export" title="把回答存成 MD / HTML / CSV / PDF / DOCX">
+        <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+          <path fill="currentColor" d="M10 3h4v8h4l-6 7-6-7h4V3zM5 20h14v2H5v-2z"/>
+        </svg>
+        <span>导出</span>
+      </button>
     </footer>
   </aside>
 
@@ -94,6 +106,7 @@
           <li>点击文档按钮上传 MD / PDF / DOCX / TXT / XLSX / PPTX，解析后可结合提问分析</li>
           <li>Enter 发送，Shift+Enter 换行</li>
           <li>开启「联网检索」后，模型会在需要时自行查证并附来源</li>
+          <li>回答可以随时导出成 MD / HTML / CSV / PDF / DOCX，导出的是屏幕上已有的内容，不再调用模型</li>
         </ul>
       </div>
       <div id="messages"></div>
@@ -137,6 +150,7 @@
         <button class="rail-btn active" type="button" data-panel="settings">设置</button>
         <button class="rail-btn" type="button" data-panel="about">关于</button>
         <button class="rail-btn" type="button" data-panel="help">帮助</button>
+        <button class="rail-btn" type="button" data-panel="export">导出</button>
       </nav>
       <div class="modal-pane">
 
@@ -204,8 +218,74 @@
             左侧列表是全部对话，点击即可回到并继续。可以重命名、删除，也可以按标题或正文内容搜索。
             对话存在服务端的 <code>runtime/history/</code> 里，每个会话一个 JSON 文件，
             连同上传过的图片一起保留；删除整个目录即清空全部历史。
-            顶栏的复制按钮可以把当前整段对话复制成文本，每条消息右上角的图标则复制单条。
+            顶栏的复制按钮可以把当前整段对话复制成文本，每条消息右上角的图标则复制单条；
+            紧挨着的导出按钮把同样的内容存成文件，见下一节。
           </p>
+
+          <h3>导出文件</h3>
+          <p>
+            顶栏的导出按钮针对整段对话，每条消息右上角的图标只导出那一条，
+            左侧底部的「导出」打开同一个面板，可以从那里改范围和格式。
+            支持 <code>MD HTML CSV PDF DOCX</code> 五种，文件一律是白底黑字，方便打印或粘进别的文档。
+            导出的是屏幕上已经渲染好的内容，不再调用模型：不花 token，也不占用那个唯一的推理 slot，
+            所以回答还在流式生成时也能导出。
+          </p>
+          <p>
+            MD / HTML / CSV 在浏览器里就地算好，PDF 与 DOCX 由服务端生成，全部在本机完成，不上传任何内容。
+            整段导出的内容与「复制整个对话」完全一致：只有正文，附件只列文件名，不含思考过程与检索来源。
+          </p>
+          <p>
+            几点限制：<code>CSV</code> 只导出正文里的 Markdown 表格，找不到表格时会提示而不是产生一个空文件；
+            图片不会被导出；段落里的换行在渲染时就已经合并成空格，所以换行要紧时请选 <code>MD</code>，
+            它逐字保存原文；PDF 与 DOCX 都保留可以点击的链接。
+          </p>
+        </section>
+
+        <section id="panel-export" class="panel">
+          <p class="panel-note muted">
+            导出的是屏幕上已经渲染好的内容，不再调用模型：不花 token，也不占用那个唯一的推理 slot，
+            所以回答还在生成时也能导出。MD / HTML / CSV 在浏览器里就地完成，PDF 与 DOCX 由服务端生成。
+          </p>
+          <div class="field-list">
+            <div class="field">
+              <div class="field-name">范围</div>
+              <div class="field-body">
+                <select id="export-scope" class="field-select" title="选择要导出的内容"></select>
+                <div class="field-reason">
+                  整段导出的内容与顶栏「复制整个对话」一致：只有正文，附件只列文件名，
+                  不含思考过程与检索来源。
+                </div>
+              </div>
+            </div>
+            <div class="field">
+              <div class="field-name">格式</div>
+              <div class="field-body">
+                <div id="export-formats">
+                  <label class="toggle" title="Markdown 原文，逐字保存，换行也在"><input type="radio" name="export-format" value="md"><span>MD</span></label>
+                  <label class="toggle" title="可以直接用浏览器打开的白底网页"><input type="radio" name="export-format" value="html"><span>HTML</span></label>
+                  <label class="toggle" title="只导出正文里的 Markdown 表格"><input type="radio" name="export-format" value="csv"><span>CSV</span></label>
+                  <label class="toggle" title="分页排好版的 PDF，适合打印"><input type="radio" name="export-format" value="pdf"><span>PDF</span></label>
+                  <label class="toggle" title="Word 文档，保留真超链接"><input type="radio" name="export-format" value="docx"><span>DOCX</span></label>
+                </div>
+                <div id="export-format-note" class="field-reason"></div>
+              </div>
+            </div>
+            <div class="field">
+              <div class="field-name">文件名</div>
+              <div class="field-body">
+                <input id="export-name" class="field-input" type="text" maxlength="40"
+                       spellcheck="false" autocomplete="off" title="导出时使用的文件名">
+                <div class="field-reason">
+                  默认取会话标题，Windows 不允许的字符换成下划线，可以直接改。
+                  时间戳与扩展名在导出时自动补上，不用自己写。
+                </div>
+              </div>
+            </div>
+          </div>
+          <div id="export-msg" class="panel-msg" role="status"></div>
+          <div class="panel-actions">
+            <button id="export-run" class="btn btn-primary" type="button">导出</button>
+          </div>
         </section>
 
       </div>

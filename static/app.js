@@ -216,6 +216,13 @@ const settingsMsgEl = $("settings-msg");
 const settingsSaveBtn = $("settings-save");
 const settingsResetBtn = $("settings-reset");
 const aboutFieldsEl = $("about-fields");
+const exportBtn = $("export-btn");
+const exportScopeEl = $("export-scope");
+const exportFormatsEl = $("export-formats");
+const exportNoteEl = $("export-format-note");
+const exportNameEl = $("export-name");
+const exportMsgEl = $("export-msg");
+const exportRunBtn = $("export-run");
 
 function loadPrefs() {
   try {
@@ -334,6 +341,7 @@ function queueSave(sid, snapshot) {
 
 const ICON_COPY = "M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z";
 const ICON_CHECK = "M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z";
+const ICON_EXPORT = "M10 3h4v8h4l-6 7-6-7h4V3zM5 20h14v2H5v-2z";
 
 async function clipboardWrite(text) {
   if (navigator.clipboard?.writeText) {
@@ -405,6 +413,227 @@ function conversationText() {
       return `${who}：\n${docs}${m.content}`;
     })
     .join("\n\n");
+}
+
+/* ------------------------------------------------------------------ *
+ * Export
+ * ------------------------------------------------------------------ */
+
+/* The message a per-message export is pointed at, or null for the whole
+   conversation. The object, never an index: newConversation() and
+   deleteSession() reassign `messages`, so an index captured while the dialog is
+   open can point at a different turn, or past the end. Re-checked with
+   includes() at export time for the same reason. */
+let exportTarget = null;
+
+/* One source of truth for what gets exported. Whole-conversation export goes
+   through conversationText() and therefore matches 「复制整个对话」 by
+   construction — same text-only body, attachments named but not inlined, no
+   reasoning and no sources — instead of by a second implementation that drifts. */
+function exportSource() {
+  if (!exportTarget) return conversationText();
+  return messages.includes(exportTarget) ? exportTarget.content : "";
+}
+
+/* The top-level block list the server needs for PDF and DOCX.
+
+   Recomputed from the markdown rather than read off msg._body.children, which
+   would be the obvious thing: user turns have no _body (renderMessage hangs one
+   only on assistant turns), so this is the form that works for both roles, for
+   restored sessions and for a turn still streaming. Block boundaries come from
+   the DOM because it is the authority — splitting the joined HTML server-side
+   was tried both by regex and by html.parser.getpos() and both got the offsets
+   wrong. */
+function blocksFromMarkdown(src) {
+  const holder = document.createElement("div");
+  holder.innerHTML = renderMarkdown(src);
+  return [...holder.children].map((el) => el.outerHTML);
+}
+
+/* A light re-authoring of the .md rules in style.css:373-400, for a file that
+   will be read somewhere else and printed. The class name is kept so the two can
+   be diffed rule by rule; only the variable values and the `pre` background
+   differ.
+
+   Two things are load-bearing. `pre` must be #f6f7f9 and NOT style.css's
+   #10131a, which prints as a solid black block. And the body font has to be
+   stated: .md inherits it from body (style.css:25-31) and a standalone file has
+   nothing to inherit from, so omitting it silently falls back to Times.
+
+   app/export.py's _PDF_CSS is the same rewrite aimed at MuPDF's HTML subset,
+   which supports only a fraction of CSS. The three copies can drift; accepted,
+   because sharing them would need a build step this app does not have. */
+const EXPORT_CSS = `
+:root {
+  color-scheme: light;
+  --accent: #0b57d0;
+  --accent-soft: rgba(11, 87, 208, 0.08);
+  --muted: #57606a;
+  --panel-2: #f6f7f9;
+  --border: #d0d7de;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; padding: 32px 20px; background: #ffffff; color: #1f2328;
+  font: 15px/1.65 "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+.md { max-width: 860px; margin: 0 auto; overflow-wrap: break-word; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 10px; }
+.md h1, .md h2, .md h3, .md h4 { margin: 16px 0 8px; line-height: 1.35; font-weight: 600; }
+.md h1 { font-size: 19px; } .md h2 { font-size: 17px; } .md h3 { font-size: 15.5px; } .md h4 { font-size: 15px; }
+.md ul, .md ol { margin: 0 0 10px; padding-left: 22px; }
+.md li { margin: 3px 0; }
+.md blockquote {
+  margin: 0 0 10px; padding: 4px 12px;
+  border-left: 3px solid var(--accent); background: var(--accent-soft);
+  border-radius: 0 8px 8px 0; color: var(--muted);
+}
+.md a { color: var(--accent); }
+.md code {
+  font-family: "Cascadia Code", Consolas, "Courier New", monospace;
+  font-size: 13px; background: var(--panel-2);
+  padding: 1.5px 5px; border-radius: 5px; border: 1px solid var(--border);
+}
+.md pre {
+  margin: 0 0 10px; padding: 12px 14px; overflow-x: auto;
+  background: #f6f7f9; border: 1px solid var(--border); border-radius: 10px;
+}
+.md pre code { background: none; border: none; padding: 0; font-size: 13px; line-height: 1.55; }
+.md hr { border: none; border-top: 1px solid var(--border); margin: 14px 0; }
+.md table { border-collapse: collapse; margin: 0 0 10px; font-size: 13.5px; width: 100%; }
+.md th, .md td { border: 1px solid var(--border); padding: 5px 9px; text-align: left; }
+.md th { background: var(--panel-2); }
+.md del { color: var(--muted); }
+`;
+
+function exportHtmlDocument(src, title) {
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${escapeHtml(title)}</title>
+<style>${EXPORT_CSS}</style>
+</head>
+<body>
+<div class="md">
+${renderMarkdown(src)}
+</div>
+</body>
+</html>
+`;
+}
+
+/* Inline markdown is noise inside a spreadsheet cell, so strip it. The mirror of
+   inlineMarkdown's patterns, run on the raw source: table helpers see the text
+   before any escaping, so this is not escapeHtml's inverse. */
+function plainInline(text) {
+  return text
+    .replace(/`([^`\n]+)`/g, "$1")
+    .replace(/\[([^\]\n]*)\]\([^)\s]+\)/g, "$1")
+    .replace(/\*\*([^*\n]+)\*\*/g, "$1")
+    .replace(/(^|[^*\w])\*([^*\n]+)\*/g, "$1$2")
+    .replace(/~~([^~\n]+)~~/g, "$1");
+}
+
+const csvCell = (v) => (/[",\r\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v);
+
+/* Consecutive pipe rows grouped into tables. Reuses isTableRow / isTableDivider
+   / splitRow rather than re-deriving them — they already handle the divider row,
+   which is the easy thing to get wrong.
+
+   Fenced code comes out first, exactly as renderMarkdown does: a | inside a code
+   block is not a table row, and treating it as one would put source code in the
+   CSV. */
+function tablesFromMarkdown(src) {
+  const tables = [];
+  let rows = null;
+  for (const line of src.replace(/```[^\n`]*\n?[\s\S]*?```/g, "\n").split("\n")) {
+    if (!isTableRow(line)) {
+      if (rows) { tables.push(rows); rows = null; }
+      continue;
+    }
+    if (isTableDivider(line)) continue;
+    (rows ??= []).push(splitRow(line).map(plainInline));
+  }
+  if (rows) tables.push(rows);
+  return tables;
+}
+
+/* Empty string when there is no table, so the caller can refuse instead of
+   writing a file with nothing in it. */
+function toCsv(src) {
+  return tablesFromMarkdown(src)
+    .map((rows) => rows.map((r) => r.map(csvCell).join(",")).join("\r\n"))
+    // CRLF is what RFC 4180 asks for. A blank line between tables keeps two of
+    // them apart when one answer holds both.
+    .join("\r\n\r\n");
+}
+
+/* Excel on this machine defaults to GBK, so a UTF-8 CSV without a byte-order
+   mark opens as mojibake. Prepended at the call site rather than inside toCsv,
+   so that function stays a plain CSV string. */
+const CSV_BOM = "\uFEFF";
+
+/* app/history.py:35 TITLE_CHARS. The same cap here and there is what lets a
+   session title become a filename without a second rule. */
+const TITLE_CHARS = 40;
+
+const FS_UNSAFE = /[\\/:*?"<>|\u0000-\u001f]/g;
+const FS_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+
+/* Not optional. The real archive at runtime/history/index.json holds a title
+   starting '> **【角色设定】**：…' — both > and * are illegal in a Windows
+   filename — and two sessions whose titles are byte-identical. */
+function sanitiseFilename(name) {
+  let s = String(name || "").replace(FS_UNSAFE, "_");
+  // Windows silently strips leading and trailing dots and spaces, so "…" and "…."
+  // are not the name the user typed once they land on disk.
+  s = s.replace(/^[.\s]+/, "").replace(/[.\s]+$/, "").slice(0, TITLE_CHARS);
+  // A device name is reserved regardless of extension, so "con.md" is still bad:
+  // Windows resolves a path component to a device by the part before the first dot.
+  // Hence the stem, not the whole string, against an anchored pattern.
+  //
+  // Deliberately no `if (!s)` here. Making the result non-empty is the caller's job,
+  // not this function's: returning "_" for empty input is truthy, which silently
+  // defeats the `|| title || "对话"` fallback chain in exportFilename and prefills
+  // the 文件名 field with "_" when there is no session. Measured, not hypothetical.
+  if (FS_RESERVED.test(s.split(".")[0])) s = `_${s}`;
+  return s;
+}
+
+function exportFilename(fmt, suffix = "") {
+  // sessions can legitimately be empty: /api/sessions 404s on a static server and
+  // can fail on a real one, and an export still has to produce a file.
+  const title = (sessions.find((s) => s.id === currentSessionId) || {}).title || "";
+  const base = sanitiseFilename(exportNameEl.value) || sanitiseFilename(title) || "对话";
+  // Minute-resolution local time. Two exports of the same conversation in the same
+  // minute are deliberately the same name — same content, same name — and the
+  // browser appends "(1)" for a real collision. The stamp is what separates two
+  // different sessions that happen to share a title, which the archive does.
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, "0");
+  const stamp = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+  return `${base}${suffix}-${stamp}.${fmt}`;
+}
+
+/* The only download path in the app. A real filename on a same-origin blob URL
+   means no navigation and no "save as" dialog. */
+function saveBlob(data, mime, filename) {
+  const blob = data instanceof Blob ? data : new Blob([data], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.style.display = "none";
+  document.body.append(a);
+  a.click();
+  // Not revoked synchronously: click() only queues the download, so revoking in
+  // the same tick races it and can produce a 0-byte file. Four seconds covers any
+  // save dialog; the cost is one object URL per export.
+  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 4000);
 }
 
 /* ------------------------------------------------------------------ *
@@ -535,6 +764,13 @@ function renderMessage(msg) {
     const copy = iconButton(msg.role === "user" ? "复制这条消息" : "复制这条回答", 14);
     copy.onclick = () => copyAndFlash(copy, msg.content);
     role.append(copy);
+
+    const exp = iconButton(msg.role === "user" ? "导出这条消息" : "导出这条回答", 14, ICON_EXPORT);
+    // Deliberately not copyAndFlash: it writes ICON_COPY back into the path after
+    // 1.2 s, so a flashed export icon would end up wearing a copy icon. The dialog
+    // appearing is the feedback here, so there is nothing to flash.
+    exp.onclick = () => openExportFor(msg, exp);
+    role.append(exp);
   }
   wrap.append(role);
 
@@ -1390,10 +1626,10 @@ async function bootSessions() {
 }
 
 /* ------------------------------------------------------------------ *
- * Settings / About / Help dialog
+ * Settings / About / Help / Export dialog
  * ------------------------------------------------------------------ */
 
-const PANEL_TITLE = { settings: "设置", about: "关于", help: "帮助" };
+const PANEL_TITLE = { settings: "设置", about: "关于", help: "帮助", export: "导出" };
 
 /* Chinese label for every field Settings has. A field the backend adds without
    this table being updated falls through to its raw name and still renders, so a
@@ -1440,9 +1676,11 @@ const FIELD_WIDGET = {
   search_max_results: { kind: "number", step: 1, min: 1, max: 10 },
 };
 
-function say(text, kind) {
-  settingsMsgEl.textContent = text;
-  settingsMsgEl.className = kind ? `panel-msg ${kind}` : "panel-msg";
+/* Defaults to the settings slot so the eight existing call sites stay as they
+   are; the export pane has its own. */
+function say(text, kind, el = settingsMsgEl) {
+  el.textContent = text;
+  el.className = kind ? `panel-msg ${kind}` : "panel-msg";
 }
 
 function fieldRow(f) {
@@ -1680,6 +1918,7 @@ function setPanel(name) {
   }
   if (activePanel === "settings") loadSettings();
   else if (activePanel === "about") loadAbout();
+  else if (activePanel === "export") renderExportPane();
 }
 
 /* inert on the two containers is the whole focus trap — no hand-written Tab cycle
@@ -1716,12 +1955,170 @@ function closePanel() {
   modalReturnFocus = null;
 }
 
+/* ------------------------------------------------------------------ *
+ * Export pane
+ * ------------------------------------------------------------------ */
+
+/* Surfaced through #export-format-note. This is where renderMarkdown's fidelity
+   limits become something the user reads instead of something they hit: no images
+   ever reach the markdown output, and a paragraph's line breaks are already
+   collapsed to spaces by the time there is HTML to export. */
+const FORMAT_NOTE = {
+  md: "逐字保存 Markdown 原文。换行要紧时选它——段落里的换行在渲染成 HTML 时就已经合并成空格了。",
+  html: "白底网页，可以直接用浏览器打开或打印。图片不会被导出。",
+  csv: "只导出正文里的 Markdown 表格，行内语法会剥掉；没有表格时不会产生文件。多张表之间空一行。",
+  pdf: "按 A4 分页排好版，适合打印，链接可以点击。由服务端生成，仍然不调用模型。",
+  docx: "Word 文档，链接可以点击，可以在 Word 里继续编辑。由服务端生成，仍然不调用模型。",
+};
+
+function exportFormat() {
+  const checked = exportFormatsEl.querySelector("input[name=export-format]:checked");
+  return checked ? checked.value : "md";
+}
+
+function renderExportPane() {
+  // Rebuilt on every open rather than kept in sync: `messages` grows while an
+  // answer streams, and a stale scope list would offer a turn that has moved.
+  if (exportTarget && !messages.includes(exportTarget)) exportTarget = null;
+
+  const scopes = [];
+  if (messages.length) scopes.push(option("all", `整段对话（${messages.length} 条）`));
+  messages.forEach((m, i) => {
+    if (!m.content) return;
+    // A preview, because "第 7 条 · 助手" is not enough to pick by in a long
+    // conversation. textContent via option(), so it cannot inject markup.
+    const head = m.content.trim().split("\n")[0].slice(0, 20);
+    const who = m.role === "user" ? "你" : "助手";
+    scopes.push(option(String(i), `第 ${i + 1} 条 · ${who}${head ? ` · ${head}` : ""}`));
+  });
+  exportScopeEl.replaceChildren(...scopes);
+  exportScopeEl.disabled = !scopes.length;
+  exportRunBtn.disabled = !scopes.length;
+  exportScopeEl.value = exportTarget ? String(messages.indexOf(exportTarget)) : "all";
+
+  // Reset on every open, the way loadSettings re-reads from the server. Nothing
+  // re-renders between editing this and clicking 导出, so an edit is never lost.
+  const title = (sessions.find((s) => s.id === currentSessionId) || {}).title || "";
+  exportNameEl.value = sanitiseFilename(title) || "对话";
+  exportNoteEl.textContent = FORMAT_NOTE[exportFormat()];
+  say("", "", exportMsgEl);
+  hintIfPromptLacksExport();
+}
+
+/* The sentence added to DEFAULT_SYSTEM_PROMPT never reaches a user who saved a
+   prompt of their own: precedence is runtime/settings_override.json, then .env,
+   then the default. Appending to a file the user hand-edited is exactly the kind
+   of change that destroys someone's work, so this stays a read-only hint — and it
+   has to say the button still works, because approach A is click-driven and the
+   sentence only affects whether the model mentions it. Losing it costs
+   discoverability, not function. */
+async function hintIfPromptLacksExport() {
+  let value = "";
+  let overridden = false;
+  try {
+    const resp = await fetch("/api/settings");
+    if (!resp.ok) return;
+    const field = ((await resp.json()).fields || []).find((f) => f.name === "system_prompt");
+    if (!field) return;
+    value = String(field.value || "");
+    overridden = Boolean(field.overridden);
+  } catch {
+    return; // no server behind this page: nothing to warn about
+  }
+  if (value.includes("导出")) return;
+  // The fetch is async, so it can land after the user has already exported.
+  if (exportMsgEl.textContent) return;
+  const where = overridden ? "你在设置面板里保存过的版本" : ".env 里的 SYSTEM_PROMPT";
+  say(`当前生效的系统提示词是${where}，不含「输出 Markdown 并提示导出」这一句，` +
+      "模型可能不会主动提到导出。导出按钮本身照常可用。", "warn", exportMsgEl);
+}
+
+function openExportFor(msg, trigger) {
+  exportTarget = msg;
+  openPanel("export", trigger);
+}
+
+async function runExport() {
+  if (exportTarget && !messages.includes(exportTarget)) {
+    say("这条消息已不在当前对话里", "warn", exportMsgEl);
+    renderExportPane();
+    return;
+  }
+  const fmt = exportFormat();
+  const src = exportSource();
+  if (!src.trim()) {
+    say("没有可导出的正文", "warn", exportMsgEl);
+    return;
+  }
+
+  const title = (sessions.find((s) => s.id === currentSessionId) || {}).title || "";
+  const suffix = exportTarget ? `-msg${messages.indexOf(exportTarget) + 1}` : "";
+  const filename = exportFilename(fmt, suffix);
+
+  exportRunBtn.disabled = true;
+  try {
+    if (fmt === "md") {
+      saveBlob(src, "text/markdown;charset=utf-8", filename);
+    } else if (fmt === "html") {
+      saveBlob(exportHtmlDocument(src, title || filename), "text/html;charset=utf-8", filename);
+    } else if (fmt === "csv") {
+      const csv = toCsv(src);
+      if (!csv) {
+        say("这段内容里没有 Markdown 表格，CSV 没有可导出的内容", "warn", exportMsgEl);
+        return;
+      }
+      saveBlob(CSV_BOM + csv, "text/csv;charset=utf-8", filename);
+    } else {
+      const resp = await fetch("/api/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ format: fmt, blocks: blocksFromMarkdown(src), title }),
+      });
+      if (!resp.ok) {
+        const detail = (await resp.json().catch(() => ({}))).detail;
+        // typeof guard, unlike the `detail || HTTP n` idiom elsewhere: ExportIn's
+        // Field(min_length/max_length) makes Pydantic answer 422 with a LIST, and
+        // a list is truthy, so that idiom would show "[object Object]".
+        throw new Error(typeof detail === "string" ? detail : `HTTP ${resp.status}`);
+      }
+      const pages = Number(resp.headers.get("X-Export-Pages") || 0);
+      const truncated = resp.headers.get("X-Export-Truncated") === "1";
+      saveBlob(await resp.blob(), resp.headers.get("Content-Type") || "", filename);
+      // The header is ASCII and the flag is what carries the meaning, because
+      // Starlette encodes headers as latin-1 and the warning is Chinese.
+      say(truncated
+        ? `已导出 ${filename}，内容超过 ${pages} 页上限，只保留了前面部分`
+        : `已导出 ${filename}${pages ? `（${pages} 页）` : ""}`, truncated ? "warn" : "ok", exportMsgEl);
+      return;
+    }
+    say(`已导出 ${filename}`, "ok", exportMsgEl);
+  } catch (err) {
+    say(`导出失败：${err.message}`, "err", exportMsgEl);
+  } finally {
+    // Not syncControls' business: it runs on a 15s poll and would fight the
+    // transient disable. Export is deliberately usable mid-stream.
+    exportRunBtn.disabled = !exportScopeEl.options.length;
+  }
+}
+
 for (const btn of sideLinks) btn.onclick = () => openPanel(btn.dataset.panel, btn);
 for (const btn of railBtns) btn.onclick = () => setPanel(btn.dataset.panel);
 modalCloseBtn.onclick = closePanel;
 modalBackdrop.onclick = closePanel;
 settingsSaveBtn.onclick = saveSettings;
 settingsResetBtn.onclick = resetSettings;
+exportBtn.onclick = () => openExportFor(null, exportBtn);
+exportRunBtn.onclick = runExport;
+// The <select> is authoritative and exportTarget is derived from it, not the
+// other way round: renderExportPane() rebuilds the options on every open, and a
+// bare exportTarget would go stale as soon as 新建对话 or deleteSession reassigns
+// `messages`. Number(v) because <select> values are strings and messages is an
+// array; `|| null` covers a scope that names a turn which has since vanished.
+exportScopeEl.onchange = () => {
+  const v = exportScopeEl.value;
+  exportTarget = v === "all" ? null : (messages[Number(v)] || null);
+};
+exportFormatsEl.onchange = () => { exportNoteEl.textContent = FORMAT_NOTE[exportFormat()]; };
 
 /* ------------------------------------------------------------------ *
  * Runtime status
@@ -1739,6 +2136,10 @@ function syncControls() {
   // a parse finishing in the background must not make the answer unstoppable.
   sendBtn.disabled = switching || runtimeState === "error" || (!streaming && docBusy > 0);
   copyBtn.disabled = !messages.length;
+  // Only the entry button is derived here. The dialog's own 导出 button belongs to
+  // runExport's finally instead: this poll would otherwise revert the transient
+  // disable, and export is deliberately usable while a stream is still running.
+  exportBtn.disabled = !messages.length;
   // Disabling the select while streaming is what avoids racing with stop(), which
   // is fire-and-forget and leaves `streaming` set until send()'s finally runs.
   modelSelect.disabled = streaming || switching || !canSwitch;
