@@ -49,6 +49,7 @@ from app.export import (
     make_pdf,
 )
 from app.history import TITLE_CHARS
+from app.tools import PROMPT_LINES, effective_prompt
 
 HAS_PYMUPDF = importlib.util.find_spec("pymupdf") is not None
 
@@ -804,25 +805,66 @@ class TestFormatDiscrimination(unittest.TestCase):
 
 
 class TestSystemPromptLine(unittest.TestCase):
+    """The 「用户想要文件时…」 sentence, and the layer it lives in.
+
+    It used to be the last line of DEFAULT_SYSTEM_PROMPT, unconditionally. Real-model
+    runs showed why that could not survive 生成文档: the model read it first and obeyed
+    it, telling the user 「由于我无法直接生成文件并让您下载」 and pointing at the export
+    button with save_document sitting in its own tool list. It now lives in
+    PROMPT_LINES and is appended only while doc_gen is off, so exactly one instruction
+    ever answers "the user wants a file".
+    """
+
     def test_export_sentence_is_present(self):
-        """The one line approach A adds. It only affects whether the model
-        *mentions* the button — the button works regardless, which is the whole
-        advantage of A over hanging a tool off TOOLS."""
-        self.assertIn("导出", DEFAULT_SYSTEM_PROMPT)
-        self.assertIn("Markdown", DEFAULT_SYSTEM_PROMPT)
-        for fmt in ("MD", "HTML", "CSV", "PDF", "DOCX"):
-            self.assertIn(fmt, DEFAULT_SYSTEM_PROMPT)
+        """The one line approach A adds, worded exactly as it was.
 
-    def test_sentences_are_newline_separated(self):
-        """Pins the edit mechanism, which is the easy thing to get wrong here.
-
-        Appending to a line that has no trailing \\n concatenates the two sentences
-        into one run-on line; the fix is to give the previous last line its \\n, not
-        to prepend one to the new line, which would leave a bare newline in the
-        middle of the string.
+        It only affects whether the model *mentions* the button — the button works
+        regardless, which is the whole advantage of A over hanging a tool off TOOLS.
+        Kept verbatim on the move: it worked fine for a model with no save_document to
+        prefer, and the assertions below were written against these words.
         """
-        self.assertNotIn("问题。用户想要文件", DEFAULT_SYSTEM_PROMPT)
-        self.assertIn("问题。\n用户想要文件", DEFAULT_SYSTEM_PROMPT)
+        line = PROMPT_LINES["export_hint"]
+        self.assertIn("导出", line)
+        self.assertIn("Markdown", line)
+        for fmt in ("MD", "HTML", "CSV", "PDF", "DOCX"):
+            self.assertIn(fmt, line)
+
+    def test_the_base_prompt_no_longer_mentions_the_button(self):
+        """The contradiction pinned from the side that caused it.
+
+        If this sentence ever finds its way back into DEFAULT_SYSTEM_PROMPT, every
+        request with 生成文档 ticked carries two answers to the same question again,
+        and the one that appears first is the one gemma obeys.
+        """
+        self.assertNotIn("导出", DEFAULT_SYSTEM_PROMPT)
+        self.assertNotIn("save_document", DEFAULT_SYSTEM_PROMPT)
+
+    def test_doc_gen_and_export_hint_never_reach_the_model_together(self):
+        """What the move buys: with 生成文档 on, nothing tells the model to hand the
+        user a button instead of calling the tool.
+
+        Asserted on 「并提示他点」 rather than on 导出, because doc_gen's own line says
+        不要让用户自己去点导出按钮 — a bare 导出 check would fail on the sentence that
+        forbids exactly what this test is about.
+        """
+        generated = effective_prompt(DEFAULT_SYSTEM_PROMPT, {"doc_gen"})
+        self.assertIn("save_document", generated)
+        self.assertNotIn("并提示他点", generated)
+        exported = effective_prompt(DEFAULT_SYSTEM_PROMPT, {"export_hint"})
+        self.assertIn("并提示他点", exported)
+        self.assertNotIn("save_document", exported)
+
+    def test_no_prompt_line_carries_its_own_newline(self):
+        """effective_prompt joins with "\\n", so a line that ends in one puts a blank
+        line in the middle of the system prompt.
+
+        This is the hazard the old test_sentences_are_newline_separated guarded, moved
+        to the layer that now does the joining: appending to DEFAULT_SYSTEM_PROMPT used
+        to be the edit, and getting the \\n wrong produced one run-on line.
+        """
+        for key, text in PROMPT_LINES.items():
+            self.assertEqual(text, text.strip(), f"{key} carries surrounding whitespace")
+        self.assertNotIn("\n\n", effective_prompt(DEFAULT_SYSTEM_PROMPT, set(PROMPT_LINES)))
 
     def test_every_line_but_the_last_ends_with_a_backslash_n(self):
         """The string's implicit invariant, asserted so the next append does not
@@ -839,45 +881,41 @@ class TestSystemPromptLine(unittest.TestCase):
         """settings_store.SettingsPatch caps system_prompt at 4000; over that the
         settings panel cannot save the prompt back at all.
 
-        Measured with the sentence in place: 412 characters and 354 tokens, up
-        from 333 and 297, leaving 3588 characters of headroom.
+        Back to 333 characters and 297 tokens now that the sentence moved out — exactly
+        what it was before approach A, leaving 3667 characters of headroom. The hint is
+        appended per request instead, which settings_store never sees and so never has
+        to fit inside the patch limit.
         """
         self.assertLessEqual(len(DEFAULT_SYSTEM_PROMPT), 4000)
+        self.assertEqual(len(DEFAULT_SYSTEM_PROMPT), 333)
 
-    def test_the_added_sentence_costs_57_tokens(self):
-        """Approach A's entire runtime price, measured rather than quoted from the
-        design notes: the prompt goes into every request, so the sentence comes
-        out of every turn's context budget.
+    def test_the_export_hint_costs_57_tokens(self):
+        """Approach A's entire runtime price, unchanged by the move: same words, same
+        57 tokens, measured here rather than quoted from the design notes.
 
-        Derived by splitting the last line off rather than by keeping a second
-        copy of the prompt here, so the number stays true if the wording above it
-        changes. The scenario this cost has to survive — smallest configured
-        window, thinking reserve, largest safety, a full complement of images —
-        is test_documents.test_four_images_survive_the_smallest_window, which
-        already recomputes budget_safety from this same prompt. Duplicating it
-        here would mean editing two files for one prompt change.
+        What the move changes is who pays it. It is appended only while 生成文档 is off,
+        so a request with that box ticked pays for doc_gen's line instead and never for
+        both — and every combination with the box unticked costs exactly what it did
+        when the sentence was baked into the default prompt.
         """
-        without = DEFAULT_SYSTEM_PROMPT.rsplit("\n", 1)[0]
-        self.assertTrue(without.endswith("问题。"), without[-20:])
-        cost = estimate_tokens(DEFAULT_SYSTEM_PROMPT) - estimate_tokens(without)
-        self.assertEqual(cost, 57)
+        self.assertEqual(estimate_tokens(PROMPT_LINES["export_hint"]), 57)
 
-    def test_a_saved_prompt_shadows_the_new_sentence(self):
-        """The hazard the export pane's warning exists for, pinned as a property
-        of the code rather than of one installation.
+    def test_a_saved_prompt_no_longer_loses_the_sentence(self):
+        """The shadowing hazard, inverted by the move.
 
-        Precedence is runtime/settings_override.json, then .env, then
-        DEFAULT_SYSTEM_PROMPT, applied by Settings(**overrides) in get_settings().
-        A user who ever saved a prompt through the settings panel keeps their own
-        text and never sees this sentence. Editing DEFAULT_SYSTEM_PROMPT cannot
-        reach them, and silently appending to a file they hand-edited is exactly
-        the kind of change that destroys someone's work — hence a read-only hint
-        in the pane instead. _env_file=None keeps this off the local .env, so it
-        says the same thing on every machine.
+        Precedence is still runtime/settings_override.json, then .env, then
+        DEFAULT_SYSTEM_PROMPT, applied by Settings(**overrides) in get_settings(). When
+        the sentence lived in the default, a user who had ever saved a prompt through the
+        settings panel kept their own text and never saw it again — editing the default
+        could not reach them, which is why the export pane could only warn about it.
+        Appending per request does reach them, and their own words are still untouched.
+        _env_file=None keeps this off the local .env, so it says the same thing on every
+        machine.
         """
-        self.assertIn("导出", Settings(_env_file=None).system_prompt)
+        self.assertNotIn("导出", Settings(_env_file=None).system_prompt)
         shadowed = Settings(_env_file=None, system_prompt="你是一个助手。").system_prompt
         self.assertEqual(shadowed, "你是一个助手。")
+        self.assertIn("导出", effective_prompt(shadowed, {"export_hint"}))
         self.assertNotIn("导出", shadowed)
 
 

@@ -197,17 +197,36 @@ class TestNativeToolCosts(unittest.TestCase):
                 self.assertEqual(_tokens(tool), tokens)
 
     def test_prompt_lines(self):
-        """The per-feature system prompt lines, which cost tokens every single turn."""
-        for key, tokens in (("memory", 128), ("think", 89), ("fs_write", 117)):
+        """The per-feature system prompt lines, which cost tokens every single turn.
+
+        export_hint and doc_gen are the two halves of one instruction: the first tells a
+        model without save_document to point at the 导出 button, the second tells a model
+        with it to call the tool. Both are pinned here because they are mutually exclusive
+        and a rewording that grows one shrinks the other's share of the same budget.
+        """
+        for key, tokens in (
+            ("memory", 128),
+            ("think", 89),
+            ("fs_write", 117),
+            ("export_hint", 57),
+            ("doc_gen", 299),
+        ):
             with self.subTest(key):
                 self.assertEqual(estimate_tokens(PROMPT_LINES[key]), tokens)
 
     def test_budget_safety_of_the_status_quo(self):
-        """The one row that needs no filesystem fixture: today's shipped default."""
+        """The one row that needs no filesystem fixture: today's shipped default.
+
+        Measured through effective_prompt rather than against the bare constant, because
+        that is what a real request sends: 生成文档 off means export_hint is appended.
+        The two are equal by design -- export_hint is verbatim the sentence that used to
+        end DEFAULT_SYSTEM_PROMPT unconditionally, so the figure did not move when it was
+        moved out, and this row stays 1737 either way.
+        """
         tools = build_tools(search=True)
+        prompt = effective_prompt(DEFAULT_SYSTEM_PROMPT, {"export_hint"})
         self.assertEqual(
-            budget_safety(DEFAULT_SYSTEM_PROMPT, json.dumps(tools, ensure_ascii=False), 8),
-            1737,
+            budget_safety(prompt, json.dumps(tools, ensure_ascii=False), 8), 1737
         )
 
     def test_disabled_features_add_nothing(self):

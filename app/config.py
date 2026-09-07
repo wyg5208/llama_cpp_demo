@@ -23,9 +23,19 @@ DEFAULT_SYSTEM_PROMPT = (
     "若节选不足以回答，或你想看另一条结果的原文，再用 fetch_url 读取那个链接；"
     "不要用相近的关键词反复检索。\n"
     "闲聊、常识、写作、翻译、代码等不依赖实时信息的问题直接回答，不要检索。\n"
-    "用户上传图片时，先客观描述图中内容，再回答用户的问题。\n"
-    "用户想要文件时，直接输出完整的 Markdown 正文，"
-    "并提示他点消息右上角的「导出」按钮保存成 MD / HTML / CSV / PDF / DOCX。"
+    "用户上传图片时，先客观描述图中内容，再回答用户的问题。"
+    # The sentence that used to end this prompt — 「用户想要文件时，直接输出完整的
+    # Markdown 正文，并提示他点消息右上角的「导出」按钮…」 — now lives in
+    # tools.PROMPT_LINES["export_hint"] and is appended only while 生成文档 is OFF.
+    # Unconditional here, it contradicted that box: the model got two instructions for
+    # the same trigger and obeyed this one, telling the user 「由于我无法直接“生成文件”
+    # 并让您下载…点消息右上角的「导出」按钮」 with save_document in its own tool list.
+    # Measured over three rounds, 20 real runs on gemma-4-E4B-it: 4 called the tool, and
+    # every one of those documents arrived intact — the longest 2,745 characters using
+    # 1,484 of the 2,048 generation tokens, so the long escaped JSON argument was never
+    # the risk this feature was rejected for. The other 16 wrote the document as prose
+    # instead, or explained that the requested length was impossible. Exactly one of the
+    # two lines is present per request now; .env.example carries the whole record.
 )
 
 

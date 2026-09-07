@@ -495,6 +495,52 @@ def safe_artifact_name(name: Any, fmt: str) -> str:
     return f"{s}.{extension}"
 
 
+# An explicit "this whole thing is markdown" fence, which is never a document's real
+# content: nothing opens a report by declaring itself a markdown code block.
+_MD_FENCE = re.compile(r"^```[ \t]*(?:markdown|md)[ \t]*\r?\n", re.I)
+
+
+def _fence_markers(text: str) -> int:
+    """Lines that open or close a code block. Inline mentions do not count: they do not
+    start the line, and only a marker at the start of one changes how the rest renders."""
+    return sum(1 for line in text.splitlines() if line.lstrip().startswith("```"))
+
+
+def unwrap_markdown_fence(content: str) -> str:
+    """Take the wrapper off a document the model fenced instead of wrote.
+
+    Measured on Qwen3-8B-Q4_K_M, six save_document calls: three handed over content that
+    began with ```markdown and never closed it. renderMarkdown then shows the whole report
+    as one grey code block, and the PDF and DOCX paths -- which go through
+    blocksFromMarkdown -- come out as a wall of monospace. The file is delivered and
+    unusable, which is worse than an error.
+
+    Stripped on the server rather than in the browser so the archived StoredArtifact holds
+    the clean text too: a session re-opened later can re-download the same document in a
+    format it was not first saved as, and that path must not need the same fix again.
+
+    Only an explicit markdown/md info string is removed. A bare ``` is left alone on
+    purpose -- unwrapping one would corrupt a document that legitimately opens with a code
+    block, and no model in the zoo has been seen to use the bare form for this.
+    """
+    if not _MD_FENCE.match(content):
+        return content
+    body = _MD_FENCE.sub("", content, count=1)
+    # The closing fence is optional: all three measured runs left it off, which is also
+    # what turned the rest of the document into code rather than a short quoted block.
+    #
+    # Whether a trailing ``` belongs to the wrapper is decided by parity, not by presence.
+    # An internal code block contributes two markers, so an even count means every fence
+    # in the body is already paired and the last one is a document's own -- stripping it
+    # there eats the tail of any report that ends with a code block, which one of the
+    # measured runs did. An odd count leaves exactly one unpaired, and it can only be the
+    # close of the wrapper removed above.
+    stripped = body.rstrip()
+    if stripped.endswith("```") and _fence_markers(stripped) % 2:
+        body = stripped[:-3].rstrip()
+    return body.lstrip("\n")
+
+
 # --- MCP schema conversion ----------------------------------------------------
 
 
@@ -594,19 +640,33 @@ def build_tools(
 # --- system prompt ------------------------------------------------------------
 
 # The character budget doc_gen's line quotes to the model, and the one number here that
-# needs its derivation written down. MAX_TOKENS=2048 over a realistic Chinese report
-# (headings, bullets, a table, a code fence) measures 2,472 characters at 1.045
-# chars/token, and passing that text back as a JSON string argument costs a further 13.6%.
-# At face value that says ~1,900 net, so 2,400 is only defensible because estimate_tokens
-# is calibrated 1.36-1.90x HIGH against the gemma tokenizer (see its docstring): the
-# tightest of those ratios, on exactly the table-heavy text a report contains, buys back
-# ~2,900. Quoting the pessimistic 1,900 instead would tell the model to leave a quarter of
-# the window unused on every document.
+# needs its derivation written down -- because two derivations of it have now been wrong,
+# and only generation counts read out of runtime/llama-server.log settled it.
+# v1 was 2,400, reasoned from estimate_tokens: face value says ~1,900 characters fit in
+# MAX_TOKENS=2048 once JSON escaping is paid for, and the documented 1.36-1.90x over-count
+# against the gemma tokenizer buys back ~2,900. Right number, unverifiable reasoning.
+# v2 was 1,800, reasoned from a truncated run: asked for 2,600 characters the model lost
+# the round, so 2,600 was recorded as the ceiling and 2,400 read as above it. That was a
+# misreading -- the model overshoots what it is asked for (asked for 1,000 it wrote 2,745),
+# so a failed *request* for 2,600 says nothing about a *document* of 2,600.
+# v3 is 2,400 again, this time measured. Three runs where save_document was actually
+# called, generation tokens from the server log against characters in the delivered artifact:
+#     529 tokens ->   805 characters   (1.52 chars/token, gemma-4-E4B-it)
+#   1,484 tokens -> 2,745 characters   (1.85 chars/token, gemma-4-E4B-it)
+#   1,433 tokens -> 2,269 characters   (1.58 chars/token, Qwen3-8B-Q4_K_M)
+# The second is the load-bearing one: 2,745 characters arrived intact using 1,484 of the
+# 2,048 budget, so a 2,400-character document needs roughly 1,300 and fits with a third of
+# the window to spare. Extrapolating the *lower* observed density to the full budget still
+# gives ~3,100 characters, so 2,400 is 77% of even the pessimistic ceiling, and the third
+# run says the density is not a gemma quirk.
+# What it is not is a length the model reproduces: it aims at the hint and overshoots a
+# user's shorter request, and a table-and-code document escapes worse than the headings-and-
+# lists text measured above. When it does overrun, llm.py's _truncation_note says so
+# explicitly instead of leaving a blank reply.
 # It stays an approximation on purpose. The real figure doubles when 深度思考 is on (that
-# path uses MAX_THINKING_TOKENS=4096), a different model's tokenizer will not match those
-# ratios, and an exact per-request number would need a second placeholder threaded through
-# effective_prompt — precision the model cannot act on. When it does overrun, llm.py's
-# _truncation_note says so explicitly instead of leaving a blank reply.
+# path uses MAX_THINKING_TOKENS=4096), a different model's tokenizer will not match, and
+# an exact per-request number would need a second placeholder threaded through
+# effective_prompt -- precision the model cannot act on.
 DOC_GEN_CHAR_HINT = 2_400
 
 # Appended per feature rather than folded into DEFAULT_SYSTEM_PROMPT, because a line
@@ -624,12 +684,48 @@ PROMPT_LINES = {
         f"一次一步，想清楚再作答；think 会占用一次工具轮次，最多 {MAX_THOUGHTS} 步。"
         "闲聊、翻译、简单问答直接回答，不要用 think。"
     ),
+    # Request O's sentence, moved out of DEFAULT_SYSTEM_PROMPT where it was unconditional
+    # and so contradicted doc_gen's line below — see the comment there for the measured
+    # result. Kept verbatim rather than reworded: it is the line test_export.py was
+    # written against, and it worked fine for a model with no save_document to prefer.
+    # Appended per request instead, which also means a user who rewrote SYSTEM_PROMPT in
+    # the settings panel can no longer lose it. Exactly one of these two lines is present
+    # in any one request; they are the same instruction for the same trigger, and the
+    # model cannot be given both.
+    "export_hint": (
+        "用户想要文件时，直接输出完整的 Markdown 正文，"
+        "并提示他点消息右上角的「导出」按钮保存成 MD / HTML / CSV / PDF / DOCX。"
+    ),
+    # Every clause below answers something a real run actually did. gemma-4-E4B-it, three
+    # rounds totalling 20 runs with 生成文档 ticked and save_document in the tool list; it
+    # called the tool 4 times. Qwen3-8B-Q4_K_M called it 6 times out of 6 and never once
+    # produced any of the sentences below, which is what makes them gemma's and not the
+    # harness's:
+    #   - told the user 「由于我无法直接生成文件并让您下载」 and pointed at the export
+    #     button, which is the contradiction export_hint's move removes;
+    #   - declared 1800, 2600 and 6000 characters 「超出了单次对话回复和模型输出的稳定
+    #     控制范围」 and handed over an outline or a 「报告骨架」 instead of a document;
+    #   - ran to max_tokens writing the document as prose, which is the truncation path
+    #     llm.py now reports rather than swallowing;
+    #   - wrote the draft and then asked 「告诉我是否需要我调用 save_document 工具」 --
+    #     a confirmation gate the user already closed by asking for a file;
+    #   - inverted the roles and said 「您需要使用 save_document 工具来下载成文件」, as
+    #     though the tool were a button on the page rather than one of its own;
+    #   - and once it did call the tool, delivered 2,131 intact characters and then
+    #     produced a single token of prose, leaving a blank bubble beside the card.
+    # So the line asserts that one call is enough, forbids each substitution by name, and
+    # requires the closing sentence. It costs more tokens than the version it replaces and
+    # that is the point: a tool the model declines to call is worth nothing.
     "doc_gen": (
-        "用户要文件时（导出、生成报告、做成表格），用 save_document 一次交出整篇："
+        "用户要文件时（导出、生成报告、下载、做成表格），立刻调用 save_document 交出整篇："
         "content 写完整的 Markdown 源文本，filename 只写文件名不带路径，一次调用只生成一份。"
-        f"内容大约以 {DOC_GEN_CHAR_HINT} 个中文字符为限，长文档请精炼分节，"
-        "写到一半被截断的话整份都作废。"
-        "调用之后不要在正文里重复整篇内容，一句话说明生成了什么即可。"
+        "save_document 是你自己调用的工具，不是让用户去用的按钮；"
+        "用户说要文件就已经是确认，直接调用，不要先给草稿再问要不要保存。"
+        "你确实能生成文件：不要说自己无法生成文件，也不要让用户自己去点导出按钮。"
+        f"一次调用装得下整篇（约 {DOC_GEN_CHAR_HINT} 个中文字符），"
+        "所以不要改成交付大纲或骨架，不要解释篇幅太长，也不要把文档写进正文。"
+        "用户要的篇幅超过这个上限时，写到上限为止即可，不要拒绝，也不要反问。"
+        "调用之后正文写一句话说明生成了什么文件：不要留空，也不要重复整篇内容。"
     ),
     # The only line with a placeholder, and the only one effective_prompt formats.
     # The allowed roots are runtime configuration and the model cannot guess an
@@ -862,7 +958,10 @@ class ToolRunner:
         }
 
     async def _save_document(self, args: dict) -> AsyncIterator[dict]:
-        content = str(args.get("content") or "")
+        # Unwrapped before the two checks below rather than after, so both see the text
+        # that will actually be delivered: a body that was nothing but a fence should fail
+        # as empty, and the fence should not count toward MAX_ARTIFACT_CHARS.
+        content = unwrap_markdown_fence(str(args.get("content") or ""))
         fmt = str(args.get("format") or "").strip().lower()
         # 120 because StoredArtifact.title is capped there: an over-long title must not
         # turn "save this session" into a 422 after the user already has the file.

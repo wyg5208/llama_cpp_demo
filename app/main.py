@@ -768,6 +768,12 @@ async def chat(req: ChatRequest) -> StreamingResponse:
                 ("memory", use_memory),
                 ("think", use_think),
                 ("doc_gen", use_doc_gen),
+                # The inverse of the line above rather than a seventh feature: both answer
+                # "the user wants a file" and giving the model both is what made it ignore
+                # save_document entirely. use_doc_gen is already clamped on supports_tools,
+                # so a model that cannot call tools at all gets this one — which is right,
+                # since clicking 导出 is then the only path to a file that exists.
+                ("export_hint", not use_doc_gen),
                 ("fs_read", use_fs_read),
                 ("fs_write", use_fs_write),
             )

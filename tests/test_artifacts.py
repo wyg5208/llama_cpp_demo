@@ -51,6 +51,7 @@ from app.tools import (
     build_tools,
     effective_prompt,
     safe_artifact_name,
+    unwrap_markdown_fence,
 )
 
 
@@ -267,6 +268,90 @@ class TestSafeArtifactName(unittest.TestCase):
                 self.assertEqual(safe_artifact_name(once, "pdf"), once)
 
 
+class TestUnwrapMarkdownFence(unittest.TestCase):
+    """Measured on Qwen3-8B-Q4_K_M: three of six save_document calls wrapped the whole
+    document in an unclosed ```markdown fence, which renders as one grey code block and
+    exports to PDF and DOCX as monospace. The file arrives and is unusable."""
+
+    def test_the_measured_shape_an_opening_fence_and_no_closing_one(self):
+        """All three real runs left the fence open, which is the worst variant: an unclosed
+        fence turns *everything after it* into code, not just a short quoted block."""
+        raw = "```markdown\n# 路线图\n\n## 1. 引言\n\n自动化测试很重要。\n"
+        self.assertEqual(unwrap_markdown_fence(raw), "# 路线图\n\n## 1. 引言\n\n自动化测试很重要。\n")
+
+    def test_a_closed_fence_loses_both_ends(self):
+        raw = "```markdown\n# 标题\n\n正文。\n```"
+        self.assertEqual(unwrap_markdown_fence(raw), "# 标题\n\n正文。")
+
+    def test_a_document_that_was_never_fenced_comes_back_byte_identical(self):
+        for raw in ("# 标题\n\n正文。", "普通一句话，没有标题。", ""):
+            with self.subTest(repr(raw[:20])):
+                self.assertEqual(unwrap_markdown_fence(raw), raw)
+
+    def test_a_bare_fence_is_left_alone(self):
+        """Deliberate: unwrapping a fence with no info string would corrupt a document that
+        legitimately opens with a code block. No model here has been seen to use the bare
+        form for the whole document, so the ambiguity is resolved by not touching it."""
+        raw = "```\nprint(1)\n```\n"
+        self.assertEqual(unwrap_markdown_fence(raw), raw)
+
+    def test_a_code_block_inside_the_document_survives(self):
+        """One of the measured runs fenced the document *and* carried a ```python example
+        inside it. Only the outer wrapper may go."""
+        raw = "```markdown\n# 手册\n\n```python\nprint('hi')\n```\n\n## 结语\n"
+        out = unwrap_markdown_fence(raw)
+        self.assertTrue(out.startswith("# 手册"))
+        self.assertIn("```python\nprint('hi')\n```", out)
+
+    def test_a_document_ending_in_a_code_block_keeps_that_blocks_own_fence(self):
+        """The shape that broke the first implementation, which decided by presence rather
+        than parity and ate the tail of any report ending in a code block.
+
+        Two markers inside means both are already paired, so the last one belongs to the
+        document. One of the measured runs produced exactly this: 下一步 was a ```python
+        block and it was the final section.
+        """
+        raw = "```markdown\n# 手册\n\n## 下一步\n\n```python\nrate = conv / visits\n```\n"
+        out = unwrap_markdown_fence(raw)
+        self.assertTrue(out.startswith("# 手册"))
+        self.assertTrue(out.rstrip().endswith("```python\nrate = conv / visits\n```"))
+
+    def test_an_unpaired_trailing_fence_is_the_wrappers_even_with_a_block_inside(self):
+        """The mirror case: three markers, so one is unpaired and can only be the wrapper's
+        close. It goes; the internal block stays."""
+        raw = "```markdown\n# 手册\n\n```python\nx = 1\n```\n\n## 结语\n\n写完。\n```"
+        out = unwrap_markdown_fence(raw)
+        self.assertIn("```python\nx = 1\n```", out)
+        self.assertTrue(out.endswith("写完。"))
+
+    def test_a_body_that_is_only_a_fence_becomes_empty(self):
+        """So _save_document's `not content.strip()` check fires and the model is told the
+        document was empty, instead of delivering a file containing nothing."""
+        self.assertEqual(unwrap_markdown_fence("```markdown\n```").strip(), "")
+        self.assertEqual(unwrap_markdown_fence("```md\n\n").strip(), "")
+
+    def test_the_info_string_tolerates_case_spaces_and_crlf(self):
+        for raw in (
+            "```MARKDOWN\n# A\n",
+            "``` md\n# A\n",
+            "```markdown\t\n# A\n",
+            "```markdown\r\n# A\r\n",
+        ):
+            with self.subTest(repr(raw[:16])):
+                self.assertTrue(unwrap_markdown_fence(raw).lstrip("\r").startswith("# A"))
+
+    def test_blank_lines_between_the_fence_and_the_document_are_dropped(self):
+        self.assertEqual(unwrap_markdown_fence("```markdown\n\n\n# A\n"), "# A\n")
+
+    def test_it_is_idempotent(self):
+        """A re-download from the archive runs the stored text through the browser, not
+        through here again, but a double strip must still be a no-op."""
+        for raw in ("```markdown\n# A\n```", "# A\n", "```\nx\n```"):
+            once = unwrap_markdown_fence(raw)
+            with self.subTest(repr(raw[:16])):
+                self.assertEqual(unwrap_markdown_fence(once), once)
+
+
 class TestSaveDocumentDispatch(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -301,6 +386,22 @@ class TestSaveDocumentDispatch(unittest.IsolatedAsyncioTestCase):
         )
         kinds = [e["type"] for e in events]
         self.assertEqual(kinds, ["artifact", "tool_result"])
+
+    async def test_a_fenced_body_reaches_the_browser_unwrapped(self):
+        """End to end, not just the helper: the event is what the browser renders and what
+        StoredArtifact archives, so the strip has to have happened by here.
+
+        chars counts the unwrapped text too -- the chip on the card and the archived copy
+        would otherwise both report a length the rendered document does not have.
+        """
+        fenced = "```markdown\n" + SAMPLE
+        events = await _collect(
+            self.runner(), SAVE_DOCUMENT, {"filename": "报告", "format": "md", "content": fenced}
+        )
+        arts = _artifacts(events)
+        self.assertEqual(len(arts), 1)
+        self.assertEqual(arts[0]["content"], SAMPLE)
+        self.assertEqual(arts[0]["chars"], len(SAMPLE))
 
     async def test_the_result_is_small_enough_not_to_eat_the_tool_budget(self):
         """Arithmetic, not taste: run() charges len(result) against MAX_TOOL_TOTAL_CHARS.
@@ -465,12 +566,20 @@ class TestBuildToolsDocGen(unittest.TestCase):
         self.assertLess(names.index(SAVE_DOCUMENT), names.index("list_directory"))
 
     def test_the_budget_the_request_actually_pays(self):
-        """budget_safety is the number fit_budget uses, so it is the one worth pinning."""
+        """budget_safety is the number fit_budget uses, so it is the one worth pinning.
+
+        2484. It has moved twice, both times because a real-model run showed the doc_gen
+        line was not doing its job: 2389 as first committed, 2420 once the export sentence
+        left the base prompt and the line forbade the substitutions the model was making,
+        2484 once a second round showed it also had to forbid asking for confirmation and
+        telling the user to operate the tool themselves. export_hint (57) is dropped in
+        the same request every time, because main.py appends one or the other, never both.
+        """
         settings = Settings(_env_file=None)
         prompt = effective_prompt(settings.system_prompt, {"doc_gen"})
         tools = build_tools(search=True, doc_gen=True)
         self.assertEqual(
-            budget_safety(prompt, json.dumps(tools, ensure_ascii=False), 8), 2389
+            budget_safety(prompt, json.dumps(tools, ensure_ascii=False), 8), 2484
         )
 
 
@@ -484,23 +593,32 @@ class TestEffectivePromptDocGen(unittest.TestCase):
         self.assertIn(str(DOC_GEN_CHAR_HINT), out)
 
     def test_the_line_costs_what_it_was_measured_at(self):
-        """147 through effective_prompt, 146 for the bare entry.
+        """299 for the bare entry and 299 for the delta through effective_prompt.
 
-        The one-token gap is estimate_tokens' trailing +1, counted once for the joined
-        prompt instead of twice. Both are written down so the difference does not read
-        as a measurement error the next time someone re-runs this.
+        The two used to differ by one, estimate_tokens' trailing +1 counted once for the
+        joined prompt instead of twice. They agree now by coincidence rather than design:
+        the rewritten line is exactly 333 characters and DEFAULT_SYSTEM_PROMPT is too, so
+        the +1 cancels. Both figures are written down so the next re-measure does not read
+        a change in the gap as an error in the estimator.
+
+        It was 146/147 as first committed, then 234/235. Each step bought clauses a
+        real-model run had shown the model ignoring, and the two tests below pin them.
         """
-        self.assertEqual(estimate_tokens(PROMPT_LINES["doc_gen"]), 146)
+        self.assertEqual(estimate_tokens(PROMPT_LINES["doc_gen"]), 299)
+        self.assertEqual(len(PROMPT_LINES["doc_gen"]), 333)
+        self.assertEqual(len(DEFAULT_SYSTEM_PROMPT), 333)
         base = estimate_tokens(DEFAULT_SYSTEM_PROMPT)
         self.assertEqual(
-            estimate_tokens(effective_prompt(DEFAULT_SYSTEM_PROMPT, {"doc_gen"})) - base, 147
+            estimate_tokens(effective_prompt(DEFAULT_SYSTEM_PROMPT, {"doc_gen"})) - base, 299
         )
 
     def test_the_default_prompt_itself_was_not_touched(self):
         """doc_gen is appended per request, so a user's saved SYSTEM_PROMPT keeps working.
 
-        This is the difference from the export sentence, which was written into the
-        default and therefore silently stops reaching anyone who overrode it.
+        The export sentence used to be the counter-example — written into the default, so
+        it silently stopped reaching anyone who had overridden it. It has since moved into
+        PROMPT_LINES for the opposite reason (it contradicted this line), which means
+        nothing in the default prompt describes a per-request capability any more.
         """
         self.assertNotIn("save_document", DEFAULT_SYSTEM_PROMPT)
         self.assertNotIn("生成文档", DEFAULT_SYSTEM_PROMPT)
@@ -513,20 +631,85 @@ class TestEffectivePromptDocGen(unittest.TestCase):
     def test_the_line_says_one_document_per_call(self):
         self.assertIn("一份", PROMPT_LINES["doc_gen"])
 
-    def test_the_character_hint_is_conservative_against_the_measured_density(self):
-        """2,400 quoted to the model vs ~2,900 the tightest calibration ratio allows.
+    def test_the_line_forbids_the_two_substitutions_the_model_actually_made(self):
+        """Measured over eight real runs on gemma-4-E4B-it, not imagined.
 
-        Re-measured here rather than trusted: SAMPLE is 2,472 characters at 1.045
-        chars/token, and JSON escaping adds 13.6%, so estimate_tokens' face value says
-        ~1,900 and only its documented 1.36-1.90x over-count buys the headroom back.
-        Quoting the pessimistic figure would waste a quarter of the window every time.
+        Twice it declared the requested length 「超出了单次对话回复和模型输出的稳定控制
+        范围」 and handed over an outline instead of a document; once it told the user
+        「由于我无法直接生成文件并让您下载」 and pointed at the export button with
+        save_document in its own tool list. Naming the tool is not enough to stop either,
+        so the line asserts one call holds a whole document and forbids both excuses.
         """
-        face_value = int(2048 * len(SAMPLE) / estimate_tokens(SAMPLE))
-        escaped = estimate_tokens(json.dumps({"content": SAMPLE}, ensure_ascii=False))
-        net = int(2048 * len(SAMPLE) / (escaped - estimate_tokens('{"content": ""}')))
-        self.assertLess(net, face_value)
-        self.assertLess(DOC_GEN_CHAR_HINT, int(net * 1.36))
-        self.assertGreater(DOC_GEN_CHAR_HINT, net)
+        line = PROMPT_LINES["doc_gen"]
+        self.assertIn("装得下整篇", line)
+        self.assertIn("大纲", line)
+        self.assertIn("无法生成文件", line)
+        self.assertIn("不要拒绝", line)
+
+    def test_the_line_closes_the_confirmation_gate_the_second_round_found(self):
+        """Two more failure sentences, from the round that ran after the export-hint move.
+
+        Neither is a length complaint, so the test above does not cover them:
+          - it wrote the whole draft as prose and then asked 「告诉我是否需要我调用
+            save_document 工具帮您下载成文件」, gating a call the user had already asked
+            for -- and isSendable would have kept that draft on the next request's wire,
+            so the model would be re-read its own hedge and could gate again;
+          - it inverted the roles: 「您需要使用 save_document 工具来下载成文件」, as though
+            the tool were a control on the page instead of one of its own.
+        Both leave the user with prose and no file, which is the whole feature failing.
+        """
+        line = PROMPT_LINES["doc_gen"]
+        self.assertIn("不是让用户去用的按钮", line)
+        self.assertIn("不要先给草稿再问要不要保存", line)
+        self.assertIn("不要反问", line)
+
+    def test_the_line_requires_a_closing_sentence(self):
+        """The one run that did call the tool delivered 2,131 intact characters and then
+        generated a single token of prose, leaving a blank bubble beside the card.
+
+        isSendable keeps a content-less turn off the next request's wire, so the model
+        would not see its own confirmation either. Permitting a short sentence is what the
+        earlier wording did, and the model read it as permission to say nothing — so this
+        asks for one and forbids the empty bubble by name.
+        """
+        line = PROMPT_LINES["doc_gen"]
+        self.assertIn("一句话", line)
+        self.assertIn("不要留空", line)
+
+    # Generation tokens read out of runtime/llama-server.log, against the characters in the
+    # artifact that run delivered. Both gemma-4-E4B-it, save_document actually called,
+    # MAX_TOKENS=2048. Literals rather than a fixture: they are observations of a model at a
+    # moment in time, nothing in this repo can reproduce them, and re-deriving them from
+    # estimate_tokens would only re-measure the estimator.
+    MEASURED_DELIVERIES = ((529, 805), (1484, 2745))
+    GEN_LIMIT = 2048
+
+    def test_the_character_hint_never_exceeds_a_measured_delivery(self):
+        """The strongest thing that can be said offline: 2,745 characters arrived intact,
+        so a hint of 2,400 is not asking for anything that has failed.
+
+        This is the assertion the previous version of this test got wrong. It recorded a
+        run that lost its round at a *request* for 2,600 characters and treated 2,600 as
+        the ceiling, which dropped the hint to 1,800 -- but the model overshoots what it is
+        asked for (asked for 1,000, it wrote 2,745), so a failed request says nothing about
+        the length that fits. Only delivered documents bound the hint.
+        """
+        largest = max(chars for _, chars in self.MEASURED_DELIVERIES)
+        self.assertLessEqual(DOC_GEN_CHAR_HINT, largest)
+
+    def test_the_character_hint_leaves_headroom_without_wasting_the_window(self):
+        """Both directions at once, from the measured densities rather than from ratios.
+
+        805/529 = 1.52 and 2745/1484 = 1.85 characters per generated token. Taking the
+        pessimistic one over the whole budget gives ~3,100 characters, so 2,400 sits at 77%
+        -- inside the ceiling with room for a table-and-code document, which escapes worse
+        than the headings-and-lists text these two runs measured, but not so far inside that
+        every document leaves a quarter of the window unused.
+        """
+        density = min(chars / tokens for tokens, chars in self.MEASURED_DELIVERIES)
+        ceiling = self.GEN_LIMIT * density
+        self.assertLess(DOC_GEN_CHAR_HINT, ceiling)
+        self.assertGreater(DOC_GEN_CHAR_HINT, ceiling * 0.6)
 
 
 class TestStoredArtifact(unittest.TestCase):
