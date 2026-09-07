@@ -7,6 +7,7 @@ from pathlib import Path
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .mcp import fs_entry_script
 from .settings_store import read_overrides
 
 log = logging.getLogger(__name__)
@@ -75,6 +76,25 @@ class Settings(BaseSettings):
     bocha_api_key: str = ""
     tavily_api_key: str = ""
 
+    # --- MCP (filesystem server over stdio) --------------------------------
+    # Optional in the strongest sense: with no Node.js on the machine the app runs
+    # exactly as before, and the file checkbox greys out.
+    mcp_enabled: bool = True
+    # Comma-separated allowed roots; empty means this project's directory (see
+    # fs_roots). A str for the same reason as n_ctx_overrides — pydantic-settings
+    # demands JSON for a list, and a comma-separated path list is what a human types.
+    # Pointing this somewhere narrower than the project is the single most effective
+    # safety measure available: the default root contains .env.
+    mcp_fs_roots: str = ""
+    # Escape hatch for app.mcp.find_node(), whose shutil.which level normally hits.
+    mcp_node_path: str = ""
+    # Cold start measured 6.1 s (first Node module load off disk), warm 0.197 s.
+    mcp_startup_timeout: int = 30
+
+    # --- native memory -----------------------------------------------------
+    # runtime/memory.json, reached through the remember / recall tools only.
+    memory_enabled: bool = True
+
     # --- web app -----------------------------------------------------------
     host: str = "127.0.0.1"
     # 8000 is commonly taken by ComfyUI on this machine.
@@ -100,6 +120,18 @@ class Settings(BaseSettings):
             stem, sep, ctx = item.rpartition("=")
             if not sep or not stem.strip() or not (ctx.strip().isdigit() and int(ctx) > 0):
                 raise ValueError(f"N_CTX_OVERRIDES 每项应形如 模型名=正整数，收到: {item!r}")
+        return value
+
+    @field_validator("mcp_fs_roots")
+    @classmethod
+    def _check_fs_roots(cls, value: str) -> str:
+        # A root that does not exist must fail here. Skipping it would hand the MCP
+        # server a shorter argv than the user wrote, and the model would then be
+        # refused access to a directory nobody can see was ever dropped.
+        for item in value.split(","):
+            item = item.strip()
+            if item and not Path(item).is_dir():
+                raise ValueError(f"MCP_FS_ROOTS 里的目录不存在: {item!r}")
         return value
 
     @property
@@ -142,6 +174,40 @@ class Settings(BaseSettings):
     def history_dir(self) -> Path:
         """Chat sessions: one index plus one JSON file per conversation."""
         return ROOT / "runtime" / "history"
+
+    @property
+    def mcp_dir(self) -> Path:
+        """Where scripts/fetch_mcp.py npm-installs the filesystem server.
+
+        Under runtime/, which .gitignore already covers — the install measured 31 MB
+        across 4,026 files, and none of it belongs in version control.
+        """
+        return ROOT / "runtime" / "mcp"
+
+    @property
+    def mcp_entry(self) -> Path:
+        """The server's entry script, and the file whose absence means "not installed".
+
+        Derived by app.mcp rather than here because scripts/fetch_mcp.py needs the
+        same path and cannot import the settings layer to get it.
+        """
+        return fs_entry_script(self.mcp_dir)
+
+    @property
+    def memory_file(self) -> Path:
+        """The model's long-term memory. One file; delete it to start over."""
+        return ROOT / "runtime" / "memory.json"
+
+    @property
+    def fs_roots(self) -> list[Path]:
+        """Directories the MCP server is allowed to see. Derived, not hardcoded.
+
+        Empty MCP_FS_ROOTS means this project, which is what makes app.tools' deny
+        list load-bearing: .env is right here in the root, and the server was measured
+        to serve it.
+        """
+        roots = [Path(item.strip()) for item in self.mcp_fs_roots.split(",") if item.strip()]
+        return roots or [ROOT]
 
     def n_ctx_for(self, model_path: Path) -> int:
         """Context to request for this model; unlisted models fall back to n_ctx."""

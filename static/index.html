@@ -32,13 +32,29 @@
     <select id="model-select" class="select" title="切换本地模型" disabled>
       <option value="">加载中…</option>
     </select>
-    <label class="toggle" title="开启后模型会先输出思考过程，更慢但更适合复杂推理">
+    <label class="toggle" title="开启后模型会先输出思考过程，更慢但更适合复杂推理。依赖模型自带的推理输出，只有部分模型支持">
       <input type="checkbox" id="thinking">
       <span>深度思考</span>
+    </label>
+    <label class="toggle" title="模型自己调用 think 工具把问题拆成几步推演，步骤显示在「思考过程」里。不依赖模型自带的推理输出，任何能调用工具的模型都能用，而且中间步骤能跨工具轮次保留。会占用工具轮次">
+      <input type="checkbox" id="use-think">
+      <span>分步</span>
     </label>
     <label class="toggle" title="开启后模型可自行决定是否联网检索">
       <input type="checkbox" id="web-search">
       <span>联网检索</span>
+    </label>
+    <label class="toggle" title="让模型主动记住你告诉它的事实与偏好，需要时再查回来。记忆存在服务端 runtime/memory.json，左下角「记忆」面板可以逐条查看和删除">
+      <input type="checkbox" id="use-memory">
+      <span>记忆</span>
+    </label>
+    <label class="toggle" title="让模型读取本机文件：列目录、读文本、按文件名搜索。默认只允许本项目目录。敏感文件（.env、密钥、证书）与 runtime/ .venv/ .git/ node_modules/ 等目录一律拒绝。需要 Node.js 与 filesystem MCP 服务器包">
+      <input type="checkbox" id="fs-read">
+      <span>文件</span>
+    </label>
+    <label class="toggle" title="允许模型在允许的目录里新建、改写、移动文件。move_file 实质是删除加改名，没有回收站，也不会先征求确认。允许的目录由 .env 的 MCP_FS_ROOTS 决定，默认就是本项目——也就是说勾上之后模型能改写这个应用自己的源码。默认关闭">
+      <input type="checkbox" id="fs-write">
+      <span>写入</span>
     </label>
     <button id="copy-btn" class="btn btn-ghost btn-icon" type="button" title="复制整个对话" aria-label="复制整个对话">
       <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
@@ -92,6 +108,12 @@
         </svg>
         <span>导出</span>
       </button>
+      <button class="side-link" type="button" data-panel="memory" title="查看并删除模型记住的内容">
+        <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+          <path fill="currentColor" d="M17 3H7a2 2 0 0 0-2 2v16l7-4 7 4V5a2 2 0 0 0-2-2zm0 15.6-5-2.9-5 2.9V5h10v13.6z"/>
+        </svg>
+        <span>记忆</span>
+      </button>
     </footer>
   </aside>
 
@@ -106,6 +128,7 @@
           <li>点击文档按钮上传 MD / PDF / DOCX / TXT / XLSX / PPTX，解析后可结合提问分析</li>
           <li>Enter 发送，Shift+Enter 换行</li>
           <li>开启「联网检索」后，模型会在需要时自行查证并附来源</li>
+          <li>「记忆」让模型记住你的偏好，「分步」让它分步推演；「文件」让它读本机文件，「写入」还允许改写——默认都是关的</li>
           <li>回答可以随时导出成 MD / HTML / CSV / PDF / DOCX，导出的是屏幕上已有的内容，不再调用模型</li>
         </ul>
       </div>
@@ -151,6 +174,7 @@
         <button class="rail-btn" type="button" data-panel="about">关于</button>
         <button class="rail-btn" type="button" data-panel="help">帮助</button>
         <button class="rail-btn" type="button" data-panel="export">导出</button>
+        <button class="rail-btn" type="button" data-panel="memory">记忆</button>
       </nav>
       <div class="modal-pane">
 
@@ -211,6 +235,63 @@
           <p>
             勾选后模型会先输出一段推理过程再作答，适合数学、代码、多步分析，但明显更慢，
             而且推理和答案共用同一份 token 预算。日常问答不需要开。
+          </p>
+
+          <h3>分步思考</h3>
+          <p>
+            与「深度思考」不是一回事，两者可以同时开，都会显示在回答上方的「思考过程」里，刷新后仍在。
+            深度思考用的是模型自带的推理输出，只有部分模型支持；
+            分步是一个叫 <code>think</code> 的工具，模型把中间推理写进去，
+            任何能调用工具的模型都能用，而且这些步骤能跨工具轮次保留下来。
+            代价是每一步都占用一个工具轮次（设置里的 <code>max_tool_rounds</code>，默认 4），
+            一次请求最多 16 步；把轮次全用来想而不作答是可能的，所以复杂问题更适合搭配联网检索一起用。
+          </p>
+
+          <h3>记忆</h3>
+          <p>
+            勾选后模型获得 <code>remember</code> 与 <code>recall</code> 两个工具：它自己决定什么值得记，
+            需要时再按关键词查回来。记忆存在服务端的 <code>runtime/memory.json</code>，跨会话、跨重启都在，
+            最多 500 条、每条不超过 500 字；删掉那个文件即全部清空。
+            左下角的「记忆」面板列出全部条目并可逐条删除——一个模型能写而你看不见的存储是不可审计的，
+            所以这个面板不是可选的装饰。
+          </p>
+          <p>
+            几点限制：<code>recall</code> 是关键词打分而不是语义检索，换个说法就找不到；
+            记忆不会自动注入每一轮上下文，只在模型真的调用 <code>recall</code> 时才进来，
+            所以它省 token，但也意味着模型可能想不起来去查；
+            模型不一定会主动记，想让它记就直说「记住……」。满了以后新记忆会被拒绝并说明原因，不会悄悄挤掉旧的。
+          </p>
+
+          <h3>本机文件访问（MCP）</h3>
+          <p>
+            「文件」与「写入」两个开关走的是 MCP：应用以子进程方式启动官方的 <code>filesystem</code> 服务器，
+            模型通过工具调用读写本机文件。需要 Node.js 与一次 <code>python scripts/fetch_mcp.py</code>；
+            缺任一样时这两个开关会自动灰掉并在悬停时说明原因，其余功能不受影响。
+            默认只允许访问本项目目录，改 <code>.env</code> 里的 <code>MCP_FS_ROOTS</code> 可以换，改完要重启应用。
+            与联网检索一样，这些都走工具调用通道，所以模板不支持工具调用的模型用不了。
+          </p>
+          <p>
+            请清楚这两件事。第一，允许的目录里有 <code>.env</code>，而 MCP 服务器只判断「路径在不在允许的目录内」，
+            它并不认识什么叫密钥——实测它会把 <code>.env</code> 连密钥一起返回。
+            所以本应用在自己的分派层另外拦了一份名单：<code>.env</code>（放行 <code>.env.example</code>）、
+            <code>*.key *.pem *.p12 *.pfx id_rsa* id_ed25519* credentials* secrets*</code>，
+            以及 <code>runtime/ .venv/ .git/ node_modules/ __pycache__/</code> 这些目录。
+            这份名单属于本应用，不属于 MCP 协议，换任何一个别的 MCP 服务器都要重新评估。
+            目录列表里仍然会出现 <code>.env</code> 这个文件名，但读不出内容。
+          </p>
+          <p>
+            第二，勾上「写入」之后模型能在允许的目录里新建、改写、移动文件：
+            <code>move_file</code> 实质是删除加改名，没有回收站，也不会先征求你的确认。
+            而默认允许的目录就是本项目，也就是说那一次勾选与「模型可以改写这个应用自己的源码」之间没有别的阻隔。
+            想更安全就把 <code>MCP_FS_ROOTS</code> 指向一个沙箱目录。
+          </p>
+          <p>
+            工具结果是有上限的：单条最多 8,000 字符，一次请求所有轮次累计最多 24,000 字符，
+            超了以后后续调用会直接被告知预算用完、请基于已有信息作答。这不是随手定的：
+            <code>directory_tree</code> 打本项目根目录实测返回 130 万字符（约 25 万 token），
+            是 40960 上下文的 6 倍多，不钳住就会把整轮对话挤出去。
+            同样因为 token，工具开得越多、schema 占的上下文越多：只读那一层约 2,200 token，加上写入约 3,500。
+            上下文只有 16384 的模型上请按需打开，不要全开。
           </p>
 
           <h3>历史对话</h3>
@@ -285,6 +366,22 @@
           <div id="export-msg" class="panel-msg" role="status"></div>
           <div class="panel-actions">
             <button id="export-run" class="btn btn-primary" type="button">导出</button>
+          </div>
+        </section>
+
+        <section id="panel-memory" class="panel">
+          <p class="panel-note muted">
+            模型用 <code>remember</code> 工具写进 <code>runtime/memory.json</code> 的全部内容，最新的在最上面。
+            能看见才能删，所以这个面板是必需的而不是装饰。
+            顶栏的「记忆」开关关掉之后模型不再读写它，但已经存下的内容仍然保留在这里。
+          </p>
+          <div id="memory-list" class="field-list"></div>
+          <div id="memory-msg" class="panel-msg" role="status"></div>
+          <div class="panel-actions">
+            <button id="memory-refresh" class="btn" type="button"
+                    title="重新读取服务端的记忆文件">刷新</button>
+            <button id="memory-clear" class="btn" type="button"
+                    title="删掉全部记忆，等于删除 runtime/memory.json，不可恢复">清空全部</button>
           </div>
         </section>
 

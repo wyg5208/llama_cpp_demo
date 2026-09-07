@@ -58,7 +58,7 @@ EDITABLE = frozenset(SettingsPatch.model_fields)
 
 SECRET_FIELDS = frozenset({"bocha_api_key", "tavily_api_key"})
 
-# Why the other 15 are read-only. Shown verbatim under the greyed-out value.
+# Why the other 20 are read-only. Shown verbatim under the greyed-out value.
 _SERVER_REASON = "需改 .env 并重启 llama-server"
 _APP_REASON = "需改 .env 并重启应用"
 REASONS = {
@@ -75,6 +75,15 @@ REASONS = {
     "host": _APP_REASON,
     "port": _APP_REASON,
     "enable_thinking": _APP_REASON,
+    # None of these join EDITABLE, and not for want of a reason: SettingsPatch
+    # promises "takes effect on the next message, no restart", while changing an
+    # allowed root means starting a new MCP child process with a different argv.
+    # Putting a restart-required field in a no-restart whitelist would be a lie.
+    "mcp_enabled": _APP_REASON,
+    "mcp_fs_roots": _APP_REASON + "；留空 = 本项目目录",
+    "mcp_node_path": _APP_REASON + "；留空 = 自动发现",
+    "mcp_startup_timeout": _APP_REASON,
+    "memory_enabled": _APP_REASON,
     # switch_model() moves the runtime, not Settings: what is shown here is the
     # boot default, and pointing the user at the dropdown is more useful than
     # telling them to restart.

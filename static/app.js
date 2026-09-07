@@ -126,8 +126,13 @@ function renderMarkdown(src) {
 
 // Conversations live on the server now; this key is read once, by the migration.
 const LEGACY_KEY = "llama-cpp-demo.history.v1";
-// The two checkboxes stay in the browser and stay global: reopening an old
+// The capability checkboxes stay in the browser and stay global: reopening an old
 // conversation should not silently change what the next turn will do.
+//
+// Still v1 even though four keys were added, because loadPrefs guards each one
+// with typeof: an old blob has no such key, so the new capability stays unticked.
+// That is the safe direction — a bumped key would also have reset web search and
+// deep thinking, which the user chose deliberately.
 const PREFS_KEY = "llama-cpp-demo.prefs.v1";
 const MAX_EDGE = 1568;
 
@@ -151,6 +156,15 @@ let vision = false;
 // null until the first status arrives, so a restored web-search tick is dropped
 // silently on page load and only a real capability *transition* warns the user.
 let tools = null;
+// The same tri-state for the three other capability sources: the loaded model's
+// tool support is only one of them. mcp covers both Node.js and the installed
+// server package, memory covers MEMORY_ENABLED. The *Why strings are what
+// /api/status says, and they go straight into the disabled toggle's tooltip, so
+// "找不到 Node.js" and "当前模型不支持工具调用" tell different stories.
+let mcp = null;
+let mcpWhy = "";
+let memoryAvail = null;
+let memoryWhy = "";
 let canSwitch = false;
 let currentModelId = "";
 
@@ -178,10 +192,21 @@ const fileInput = $("file-input");
 const docBtn = $("doc-btn");
 const docInput = $("doc-input");
 const previewsEl = $("previews");
+// The five capability toggles and the tooltip each one started with. syncControls
+// rewrites title on every poll to explain why a box is grey, so without the original
+// kept aside it would replace the reason with itself and the explanation would be
+// unrecoverable once the capability came back.
 const searchToggle = $("web-search");
-const searchLabel = searchToggle.closest("label");
-const SEARCH_TITLE = searchLabel.title;
+const SEARCH_TITLE = searchToggle.closest("label").title;
 const thinkingToggle = $("thinking");
+const thinkToggle = $("use-think");
+const THINK_TITLE = thinkToggle.closest("label").title;
+const memoryToggle = $("use-memory");
+const MEMORY_TITLE = memoryToggle.closest("label").title;
+const fsReadToggle = $("fs-read");
+const FS_READ_TITLE = fsReadToggle.closest("label").title;
+const fsWriteToggle = $("fs-write");
+const FS_WRITE_TITLE = fsWriteToggle.closest("label").title;
 const newChatBtn = $("new-chat-btn");
 const copyBtn = $("copy-btn");
 const modelSelect = $("model-select");
@@ -223,12 +248,32 @@ const exportNoteEl = $("export-format-note");
 const exportNameEl = $("export-name");
 const exportMsgEl = $("export-msg");
 const exportRunBtn = $("export-run");
+const memoryListEl = $("memory-list");
+const memoryMsgEl = $("memory-msg");
+const memoryRefreshBtn = $("memory-refresh");
+const memoryClearBtn = $("memory-clear");
+
+// One table drives both halves below, and names each toggle for the alerts that have
+// to say which boxes a lost capability closed. Six toggles spelled out twice is six
+// chances for the two to disagree about a key name, and a key savePrefs writes but
+// loadPrefs never reads is a preference that silently stops sticking with nothing
+// anywhere to say so. The first two key names predate this table and are kept
+// verbatim: migrateLegacyHistory and every browser's existing blob already use them.
+const PREF_TOGGLES = [
+  ["webSearch", searchToggle, "联网检索"],
+  ["thinking", thinkingToggle, "深度思考"],
+  ["useThink", thinkToggle, "分步思考"],
+  ["useMemory", memoryToggle, "记忆"],
+  ["fsRead", fsReadToggle, "文件"],
+  ["fsWrite", fsWriteToggle, "写入"],
+];
 
 function loadPrefs() {
   try {
     const saved = JSON.parse(localStorage.getItem(PREFS_KEY) || "{}");
-    if (typeof saved.webSearch === "boolean") searchToggle.checked = saved.webSearch;
-    if (typeof saved.thinking === "boolean") thinkingToggle.checked = saved.thinking;
+    for (const [key, box] of PREF_TOGGLES) {
+      if (typeof saved[key] === "boolean") box.checked = saved[key];
+    }
   } catch {
     /* first run, or a value somebody hand-edited: keep the defaults */
   }
@@ -236,10 +281,9 @@ function loadPrefs() {
 
 function savePrefs() {
   try {
-    localStorage.setItem(
-      PREFS_KEY,
-      JSON.stringify({ webSearch: searchToggle.checked, thinking: thinkingToggle.checked })
-    );
+    const out = {};
+    for (const [key, box] of PREF_TOGGLES) out[key] = box.checked;
+    localStorage.setItem(PREFS_KEY, JSON.stringify(out));
   } catch {
     /* private mode or quota: the checkboxes simply are not remembered */
   }
@@ -1240,6 +1284,12 @@ async function send() {
         messages: wireMessages(),
         web_search: searchToggle.checked,
         thinking: thinkingToggle.checked,
+        // Re-clamped in the handler against model and machine, so a tick that went
+        // stale in a background tab costs a log line, not a capability.
+        use_memory: memoryToggle.checked,
+        use_think: thinkToggle.checked,
+        fs_read: fsReadToggle.checked,
+        fs_write: fsWriteToggle.checked,
       }),
       signal: abortController.signal,
     });
@@ -1356,6 +1406,18 @@ copyBtn.onclick = () => copyAndFlash(copyBtn, conversationText());
 
 searchToggle.onchange = savePrefs;
 thinkingToggle.onchange = savePrefs;
+thinkToggle.onchange = savePrefs;
+memoryToggle.onchange = savePrefs;
+// Unticking 文件 takes 写入 with it. The server clamps fs_write against fs_read
+// regardless, so this is honesty on screen rather than correctness: without it the
+// user is left looking at a ticked box that says writing is on, greyed out, above a
+// capability that is off.
+fsReadToggle.onchange = () => {
+  if (!fsReadToggle.checked) fsWriteToggle.checked = false;
+  savePrefs();
+  syncControls(); // 写入's disabled state is derived from this box
+};
+fsWriteToggle.onchange = savePrefs;
 
 /* ------------------------------------------------------------------ *
  * Session sidebar
@@ -1626,10 +1688,15 @@ async function bootSessions() {
 }
 
 /* ------------------------------------------------------------------ *
- * Settings / About / Help / Export dialog
+ * Settings / About / Help / Export / Memory dialog
  * ------------------------------------------------------------------ */
 
-const PANEL_TITLE = { settings: "设置", about: "关于", help: "帮助", export: "导出" };
+/* Key order matches the rail. Adding a key here is the whole of the wiring for a
+   new panel: setPanel toggles `panel-<key>` for every key and validates the name
+   against this same object. */
+const PANEL_TITLE = {
+  settings: "设置", about: "关于", help: "帮助", export: "导出", memory: "记忆",
+};
 
 /* Chinese label for every field Settings has. A field the backend adds without
    this table being updated falls through to its raw name and still renders, so a
@@ -1658,6 +1725,14 @@ const FIELD_LABEL = {
   search_max_results: "检索结果条数",
   bocha_api_key: "BOCHA 密钥",
   tavily_api_key: "Tavily 密钥",
+  // Read-only in the panel by design: MCP_FS_ROOTS only takes effect in the argv of
+  // a freshly started Node child, and the editable set's contract is "next message,
+  // no restart". Each row says so through settings_store's REASONS.
+  mcp_enabled: "启用文件访问（MCP）",
+  mcp_fs_roots: "允许访问的目录",
+  mcp_node_path: "Node.js 路径",
+  mcp_startup_timeout: "MCP 启动超时（秒）",
+  memory_enabled: "启用记忆",
   host: "监听地址",
   port: "监听端口",
 };
@@ -1919,6 +1994,10 @@ function setPanel(name) {
   if (activePanel === "settings") loadSettings();
   else if (activePanel === "about") loadAbout();
   else if (activePanel === "export") renderExportPane();
+  // Fetched on open rather than kept live: the model writes memories from inside a
+  // turn, and there is no channel to be told about it. 刷新 covers the case where
+  // the panel was already open when that happened.
+  else if (activePanel === "memory") loadMemories();
 }
 
 /* inert on the two containers is the whole focus trap — no hand-written Tab cycle
@@ -2121,6 +2200,130 @@ exportScopeEl.onchange = () => {
 exportFormatsEl.onchange = () => { exportNoteEl.textContent = FORMAT_NOTE[exportFormat()]; };
 
 /* ------------------------------------------------------------------ *
+ * Memory pane
+ * ------------------------------------------------------------------ */
+
+/* A store the model can write to has to be one the user can read and empty, or it
+   is not auditable. That is the whole reason this pane exists instead of
+   runtime/memory.json simply living on disk. */
+
+// An unknown kind cannot reach here — memory_store folds it into "fact" before
+// writing — but the map falls through to the raw value the way FIELD_LABEL does, so
+// a kind added later renders as itself rather than as a blank.
+const MEMORY_KIND = { fact: "事实", preference: "偏好", todo: "待办" };
+
+let memories = [];
+
+function memoryRow(m) {
+  const row = document.createElement("div");
+  // .session brings the row shape, the hover wash and the hover-revealed .msg-copy;
+  // .memory-item undoes the two parts that only make sense for a conversation you
+  // can click open — the pointer, and the one-line clamp a memory would lose text to.
+  row.className = "session memory-item";
+  row.dataset.id = m.id;
+  // `created` is UTC ISO: the right thing to sort on and the wrong thing to read.
+  // The row shows a relative time, the tooltip the absolute local one.
+  row.title = m.created ? `记于 ${new Date(m.created).toLocaleString()}` : "";
+
+  const main = document.createElement("div");
+  main.className = "session-main";
+  const text = document.createElement("div");
+  text.className = "session-title";
+  text.textContent = m.text || "";
+  const meta = document.createElement("div");
+  meta.className = "session-meta";
+  meta.textContent = `${MEMORY_KIND[m.kind] || m.kind || "记忆"} · ${relTime(m.created)}`;
+  main.append(text, meta);
+
+  const del = iconButton("删除这条记忆", 14, ICON_DELETE);
+  del.classList.add("danger");
+  del.onclick = () => deleteMemory(m);
+
+  row.append(main, del);
+  return row;
+}
+
+function renderMemories() {
+  memoryListEl.replaceChildren();
+  if (!memories.length) {
+    const empty = document.createElement("div");
+    empty.className = "session-empty";
+    empty.textContent =
+      "还没有记忆。勾选顶栏「记忆」后，模型会把它认为值得长期记住的内容通过 remember 存进来。";
+    memoryListEl.append(empty);
+    return;
+  }
+  for (const m of memories) memoryListEl.append(memoryRow(m));
+}
+
+async function loadMemories() {
+  memoryRefreshBtn.disabled = true;
+  try {
+    const resp = await fetch("/api/memory");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    memories = Array.isArray(data.items) ? data.items : [];
+    renderMemories();
+    say(`${memories.length} 条 · runtime/memory.json`, "", memoryMsgEl);
+  } catch (err) {
+    // Left as it was rather than emptied, the choice refreshSessions also makes: a
+    // dead backend is already reported by the dot, and wiping the pane would look
+    // like the memories themselves were lost.
+    say(`读取记忆失败：${err.message}`, "err", memoryMsgEl);
+  } finally {
+    memoryRefreshBtn.disabled = false;
+  }
+}
+
+async function deleteMemory(m) {
+  try {
+    const resp = await fetch(`/api/memory/${encodeURIComponent(m.id)}`, { method: "DELETE" });
+    if (!resp.ok) {
+      const detail = (await resp.json().catch(() => ({}))).detail;
+      throw new Error(detail || `HTTP ${resp.status}`);
+    }
+  } catch (err) {
+    say(`删除失败：${err.message}`, "err", memoryMsgEl);
+    return;
+  }
+  // Dropped locally instead of re-fetched: exactly one row is known to be gone and a
+  // round trip would only confirm it. A 404 arrives here too, which is the right
+  // outcome — the memory is already gone, so the pane should stop showing it.
+  memories = memories.filter((x) => x.id !== m.id);
+  renderMemories();
+  const clipped = (m.text || "").slice(0, 40);
+  say(`已删除：${clipped}${(m.text || "").length > 40 ? "…" : ""}`, "ok", memoryMsgEl);
+}
+
+async function clearMemory() {
+  if (!memories.length) {
+    say("没有可清空的记忆", "warn", memoryMsgEl);
+    return;
+  }
+  // Unrecoverable, and deleting runtime/memory.json by hand is the same operation —
+  // no trash, no undo. deleteSession already asks, so this does too.
+  if (!confirm(`删掉全部 ${memories.length} 条记忆？删除后无法恢复。`)) return;
+  memoryClearBtn.disabled = true;
+  try {
+    const resp = await fetch("/api/memory", { method: "DELETE" });
+    if (!resp.ok) {
+      const detail = (await resp.json().catch(() => ({}))).detail;
+      throw new Error(detail || `HTTP ${resp.status}`);
+    }
+    memories = [];
+    renderMemories();
+    say("已清空全部记忆", "ok", memoryMsgEl);
+  } catch (err) {
+    say(`清空失败：${err.message}`, "err", memoryMsgEl);
+  } finally {
+    memoryClearBtn.disabled = false;
+  }
+}
+
+memoryRefreshBtn.onclick = loadMemories;
+memoryClearBtn.onclick = clearMemory;
+
+/* ------------------------------------------------------------------ *
  * Runtime status
  * ------------------------------------------------------------------ */
 
@@ -2128,6 +2331,14 @@ const STATE_CLASS = { ready: "dot-ready", external: "dot-ready", loading: "dot-l
   starting: "dot-loading", switching: "dot-loading", error: "dot-error", stopped: "dot-error" };
 const STATE_TEXT = { ready: "运行中", external: "外部服务", loading: "加载模型中",
   starting: "启动中", switching: "切换模型中", error: "不可用", stopped: "已停止" };
+
+/* Grey a toggle and say why, in one step. Splitting the two is how a box ends up
+   disabled while its tooltip still advertises the feature, which reads as a bug
+   rather than as an explanation. An empty reason means "available". */
+function gate(box, baseTitle, reason) {
+  box.disabled = Boolean(reason);
+  box.closest("label").title = reason || baseTitle;
+}
 
 /* Every disabled state is derived here and nowhere else — the 15s poll below would
    otherwise revert whatever a one-off handler had set. */
@@ -2146,8 +2357,29 @@ function syncControls() {
   attachBtn.disabled = !vision;
   attachBtn.title = vision ? "上传图片" : "当前模型不支持图片理解";
   fileInput.disabled = !vision;
-  searchToggle.disabled = !tools;
-  searchLabel.title = tools ? SEARCH_TITLE : "当前模型不支持工具调用，联网检索不可用";
+
+  // All five ride the tool-calling channel, so the model's support for it is checked
+  // before any of their own reasons. `tools` is tri-state — null until the first
+  // status arrives — and null gates them shut, which is the safe direction: for the
+  // moment before we know, nothing that needs a capability can be switched on.
+  const noTools = tools ? "" : "当前模型不支持工具调用";
+  gate(searchToggle, SEARCH_TITLE, noTools && `${noTools}，联网检索不可用`);
+  gate(thinkToggle, THINK_TITLE, noTools && `${noTools}，分步思考不可用`);
+  // === false rather than !: an absent field means "unknown" and must not gate, the
+  // same fail-open applyTools has always used. /api/status does report both, so this
+  // is about the shape of the check, not a case that can actually occur.
+  gate(memoryToggle, MEMORY_TITLE,
+    (noTools && `${noTools}，记忆不可用`)
+    || (memoryAvail === false && (memoryWhy || "记忆已在 .env 中关闭")));
+  const noMcp = mcp === false ? (mcpWhy || "文件访问不可用") : "";
+  gate(fsReadToggle, FS_READ_TITLE, (noTools && `${noTools}，文件访问不可用`) || noMcp);
+  // 写入 is an addition to 文件 rather than a capability of its own, and the server
+  // clamps it the same way, so this last reason is the only one that is about another
+  // checkbox instead of about the machine.
+  gate(fsWriteToggle, FS_WRITE_TITLE,
+    (noTools && `${noTools}，写入不可用`) || noMcp
+    || (fsReadToggle.checked ? "" : "需要先勾选「文件」"));
+
   // inert, not disabled: disabled on a container still lets its children's click
   // handlers fire, whereas inert blocks both pointer and keyboard. The search box
   // sits outside the list precisely so filtering survives a stream.
@@ -2174,12 +2406,53 @@ function applyVision(next) {
 function applyTools(next) {
   const had = tools;
   tools = next !== false; // a missing field means "unknown" -> allow
-  if (!tools && searchToggle.checked) {
-    searchToggle.checked = false;
-    savePrefs(); // otherwise the next reload restores it ticked
-    // A tick restored from localStorage is not something the user just did, so
-    // only a real capability change speaks up.
-    if (had) alert("当前模型不支持工具调用，已关闭联网检索");
+  if (!tools) {
+    // 深度思考 is the one toggle that does not ride tool calling — it is a flag on
+    // the request body, not a tool — so it survives a model that has none. The rest
+    // are unticked rather than left greyed-and-ticked: the server clamps them anyway,
+    // and a tick left in localStorage would come back the next time a model that does
+    // support tools is loaded, which is not a decision the user just made.
+    const dropped = PREF_TOGGLES.filter(([key, box]) => key !== "thinking" && box.checked);
+    for (const [, box] of dropped) box.checked = false;
+    if (dropped.length) {
+      savePrefs(); // otherwise the next reload restores them ticked
+      // A tick restored from localStorage is not something the user just did, so
+      // only a real capability change speaks up.
+      if (had) {
+        alert(`当前模型不支持工具调用，已关闭${dropped.map(([, , label]) => label).join("、")}`);
+      }
+    }
+  }
+  syncControls();
+}
+
+/* Both of these follow applyTools' shape exactly: `next !== false` fails open, the
+   reason string is kept for syncControls' tooltip, and only a transition from
+   available to unavailable alerts — so a preference restored from localStorage is
+   undone quietly on page load and the user is not greeted by a dialog. */
+function applyMcp(next, why) {
+  const had = mcp;
+  mcp = next !== false;
+  mcpWhy = why || "";
+  if (!mcp && (fsReadToggle.checked || fsWriteToggle.checked)) {
+    fsReadToggle.checked = false;
+    fsWriteToggle.checked = false;
+    savePrefs();
+    // One alert for both boxes: they are one capability from the user's point of
+    // view, and two dialogs saying the same thing read as a loop.
+    if (had) alert(`本机文件访问不可用，已关闭「文件」与「写入」：${mcpWhy}`);
+  }
+  syncControls();
+}
+
+function applyMemory(next, why) {
+  const had = memoryAvail;
+  memoryAvail = next !== false;
+  memoryWhy = why || "";
+  if (!memoryAvail && memoryToggle.checked) {
+    memoryToggle.checked = false;
+    savePrefs();
+    if (had) alert(`记忆不可用，已关闭：${memoryWhy}`);
   }
   syncControls();
 }
@@ -2194,11 +2467,15 @@ function applyStatus(s) {
   modelName.textContent = s.model || "未知模型";
   const bits = [STATE_TEXT[s.state] || s.state, s.backend, `ctx ${s.n_ctx}`];
   if (s.vision) bits.push("图片理解");
-  bits.push(s.tools === false ? "检索 不可用" : `检索 ${s.search_provider}`);
+  // Widened from "检索 不可用": five capabilities ride tool calling now, and naming
+  // only search would leave the other four grey boxes without an explanation here.
+  bits.push(s.tools === false ? "工具调用 不可用" : `检索 ${s.search_provider}`);
   runtimeMeta.textContent = s.state === "error" ? s.detail.split("\n")[0] : bits.join(" · ");
   runtimeMeta.title = s.detail || "";
   applyVision(s.vision);
   applyTools(s.tools);
+  applyMcp(s.mcp, s.mcp_detail);
+  applyMemory(s.memory, s.memory_detail);
 }
 
 async function refreshStatus() {

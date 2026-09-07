@@ -37,7 +37,12 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  /* Wraps rather than clips: the bar now carries six capability toggles on top of
+     the brand, the meter and four buttons, and there is no width at which all of
+     them fit beside a 264px sidebar. A clipped toggle is an unreachable one —
+     these are browser-side preferences with no copy anywhere else in the UI. */
+  flex-wrap: wrap;
+  gap: 8px 16px;
   padding: 10px 20px;
   background: var(--panel);
   border-bottom: 1px solid var(--border);
@@ -55,7 +60,14 @@ body {
 .dot-error { background: var(--err); }
 @keyframes pulse { 50% { opacity: 0.35; } }
 
-.topbar-actions { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+/* flex: 0 1 auto (not 0 0 auto) plus margin-left: auto — the group has to be
+   allowed to shrink for the wrap above to trigger, and the auto margin is what
+   keeps it flush right on its own row, where space-between would otherwise push
+   it to the left edge. */
+.topbar-actions {
+  display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end;
+  gap: 8px 10px; flex: 0 1 auto; margin-left: auto;
+}
 
 .toggle {
   display: inline-flex;
@@ -182,8 +194,16 @@ body {
 .session .msg-copy:hover { opacity: 1; }
 .session .msg-copy.danger:hover { color: var(--err); }
 
+/* The memory panel's rows reuse .session wholesale — the shape, the hover wash
+   and the hover-revealed .msg-copy delete button — so all that is needed is to
+   undo the two parts that assume a clickable conversation. The title clamp
+   matters most: a memory is one sentence of up to 500 characters, and this panel
+   exists so it can be read in full before being deleted, so it must wrap. */
+.memory-item { cursor: default; }
+.memory-item .session-title { white-space: normal; overflow-wrap: anywhere; }
+
 /* Pinned under the list rather than inside it: .session-list owns the scroll, so
-   these three stay reachable however long the history gets. */
+   these stay reachable however long the history gets. */
 .sidebar-foot { flex: 0 0 auto; display: flex; gap: 2px; padding: 8px 10px; border-top: 1px solid var(--border); }
 .side-link {
   flex: 1 1 0; min-width: 0;

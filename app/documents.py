@@ -596,12 +596,19 @@ def _stub(name: str) -> str:
 def budget_safety(system_prompt: str, tools_json: str, n_messages: int) -> int:
     """What this request costs in prompt tokens beyond the messages fit_budget sees.
 
-    to_openai_messages prepends the system prompt (llm.py:68-69) and llama-server
+    to_openai_messages prepends the system prompt (llm.py:80-81) and llama-server
     wraps the list in tool schemas and chat-template markup, so none of the three
     are in `messages` and none are counted by _msg_tokens. `tools_json` is the
-    serialised schema, or "" when the model cannot call tools — the schemas are
-    only sent inside `if use_search:` (llm.py:140-142), so charging a tool-less
-    model for them would throw the tokens away.
+    serialised schema, or "" when nothing is being offered — the schemas are only
+    sent inside `if tools:` (llm.py:166-168), so charging a request that carries
+    none for them would throw the tokens away.
+
+    Both arguments have to be the objects that actually go on the wire: the prompt
+    tools.effective_prompt returned, and the list tools.build_tools assembled. That
+    list is between 2 and 15 schemas depending on four checkboxes, so a caller that
+    serialised a module constant instead would charge for 2 while sending 15 and
+    fit_budget would admit history that does not fit. main.py assembles once and
+    passes the same two objects to both places, which is what makes that impossible.
 
     `n_messages` is the PRE-trim count: Stage C may drop turns after this is
     computed, so the template term over-counts. That is the safe direction.

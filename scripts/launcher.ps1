@@ -41,6 +41,53 @@ if (-not (Test-Path -LiteralPath $py)) {
 }
 
 # ------------------------------------------------------------------
+# 1b. MCP 的可选依赖：Node.js 与 filesystem 服务器包
+#
+#     只警告，绝不 exit 1。MCP 缺席时应用完全可用，只是顶栏的「文件」与
+#     「写入」两个复选框会灰掉、并在悬停时说明原因（/api/status 的 mcp
+#     字段）。提前说一声，是为了让人在浏览器打开之前就知道为什么会灰。
+#
+#     Node 的发现交给 app/mcp.py 的 find_node()，不在这里重写一份：它有四级
+#     降级，第三级直接读注册表里的 PATH，而本脚本可能是在一个 PATH 早于
+#     Node.js 安装的旧终端里被调起来的——那时 Get-Command 和 $env:Path 都看
+#     不见 node.exe，注册表却已经更新了。本机正是如此：Node 装在 D 盘，
+#     「Get-Command 找不到就试 %ProgramFiles%\nodejs」这种写法会误报。
+#     代价是一次约 0.2 秒的解释器启动，而模型加载本来就要 7~30 秒。
+# ------------------------------------------------------------------
+$mcpEntry = Join-Path $Root 'runtime\mcp\node_modules\@modelcontextprotocol\server-filesystem\dist\index.js'
+$probe = ''
+try {
+    # 用环境变量而不是把 $Root 插进代码字符串：路径里的引号和反斜杠会毁掉
+    # Python 源码，而 os.environ 读出来的一定是原样的路径。
+    $env:LLAMA_DEMO_ROOT = $Root
+    # 代码里一个双引号都不能有，只能用 PowerShell 的 '' 转义出单引号：
+    # PS 5.1 往原生命令传参时不会正确转义参数内部的双引号，实测 Python 收到
+    # 的是被劈开的源码，报 SyntaxError，再被下面的 catch 吞成永久沉默——
+    # 那会让整段检查变成死代码。
+    # 2>&1 而不是 2>$null：$ErrorActionPreference 是 Stop，原生命令的 stderr
+    # 会被包成 ErrorRecord 并就地终止脚本（第 128 行的 taskkill 同一个坑）。
+    $raw = (& $py -c 'import os, sys; sys.path.insert(0, os.environ[''LLAMA_DEMO_ROOT'']); from app.mcp import find_node; n = find_node(); print(''NODE:'' + str(n) if n else ''NONE'')' 2>&1 | Out-String)
+    if ($LASTEXITCODE -eq 0) { $probe = $raw.Trim() }
+}
+catch { }
+
+if ($probe.StartsWith('NODE:')) {
+    if (-not (Test-Path -LiteralPath $mcpEntry)) {
+        Write-Host ''
+        Write-Host '[提示] 还没有安装 filesystem MCP 服务器包，「文件」「写入」会灰掉。'
+        Write-Host '       需要时执行：.venv\Scripts\python.exe scripts\fetch_mcp.py'
+    }
+}
+elseif ($probe -eq 'NONE') {
+    Write-Host ''
+    Write-Host '[提示] 没有找到 Node.js，MCP 文件访问不可用（其余功能不受影响）。'
+    Write-Host '       安装 https://nodejs.org 后重开终端即可；装在非默认位置的话，'
+    Write-Host '       在 .env 里把 MCP_NODE_PATH 指向 node.exe。'
+}
+# 第三种情况是探测本身没跑成（解释器报错、依赖没装全），那时什么都不说：
+# 说不准的事不要当结论报给用户，应用起来以后 /api/status 会给准确答案。
+
+# ------------------------------------------------------------------
 # 2. 读 .env 里的 HOST / PORT / LLAMA_PORT，读不到就用默认值
 #    只取这三个键，其它内容（含 API 密钥）不读进来也不打印。
 # ------------------------------------------------------------------
@@ -89,10 +136,18 @@ Write-Host '[1/2] 检测并结束旧进程...'
 #    为什么要 (a) 里的 run.py 限定：本机上 ComfyUI 也在跑 python.exe，
 #    Ollama 也带一个 llama-server.exe，只按进程名匹配会误杀。
 #
+#    为什么要给 node.exe 再加一条 server-filesystem 限定：MCP 子进程是应用
+#    异常退出后最可能变孤儿的那一个，所以要一并结束；但 node.exe 是极常见的
+#    进程名，光靠「命令行含项目路径」不够放心。实测真实的命令行是
+#      "D:\...\node.exe" <root>\runtime\mcp\node_modules\@modelcontextprotocol\
+#      server-filesystem\dist\index.js <root>
+#    两个标记都在里面。选包名而不是 'runtime\mcp'，是因为包名不含路径分隔符，
+#    正反斜杠都匹配得上。
+#
 #    路径比较一律转小写：.NET 的 String.Contains 区分大小写，而命令行里的盘符
 #    是 d: 还是 D: 取决于当初怎么启动的，实测两种都出现过。
 # ------------------------------------------------------------------
-$names = @('python.exe', 'pythonw.exe', 'llama-server.exe')
+$names = @('python.exe', 'pythonw.exe', 'llama-server.exe', 'node.exe')
 $rootLower = $Root.ToLowerInvariant()
 $listen = Get-ListeningPids -Ports $ports
 $targets = @()
@@ -103,6 +158,7 @@ foreach ($p in (Get-CimInstance Win32_Process)) {
     $lcl = $cl.ToLowerInvariant()
     $byCmd = $lcl.Contains($rootLower) -and (
         $p.Name -eq 'llama-server.exe' -or
+        ($p.Name -eq 'node.exe' -and $lcl.Contains('server-filesystem')) -or
         $lcl.Contains('run.py') -or
         $lcl.Contains('uvicorn') -or
         $lcl.Contains('app.main'))

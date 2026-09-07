@@ -33,9 +33,10 @@ from .export import (
     check_blocks,
 )
 from .llm import ChatMessage, stream_chat
+from .mcp import MCPHost
+from .memory_store import MemoryStoreError, clear_memories, delete_memory, list_memories
 from .models import find_model, save_active_model, scan_models
 from .runtime import LlamaRuntime, RuntimeUnavailable
-from .search import TOOLS
 from .settings_store import (
     EDITABLE,
     SettingsPatch,
@@ -45,6 +46,7 @@ from .settings_store import (
     read_overrides,
 )
 from .sysstats import SystemStats
+from .tools import ToolRunner, build_tools, effective_prompt, fs_tool_names
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 log = logging.getLogger("app")
@@ -63,6 +65,9 @@ MAX_CHAT_MESSAGES = 200
 MAX_SESSION_MESSAGES = 400
 
 runtime: LlamaRuntime | None = None
+# One MCP server for the whole app, shared by every request. Constructed in lifespan
+# but started on first use — see MCPHost.
+mcp_host: MCPHost | None = None
 # Built once so the NVML handle stays open; re-initialising the driver per
 # request would be the expensive part of an otherwise free endpoint.
 stats = SystemStats()
@@ -70,9 +75,13 @@ stats = SystemStats()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    global runtime
+    global runtime, mcp_host
     settings = get_settings()
     runtime = LlamaRuntime(settings)
+    # Constructing this cannot fail: no Node.js, no installed server and no allowed
+    # root is discovered here, and each turns into "the file capability is unavailable"
+    # later rather than a refused boot. MCP is optional and stays optional.
+    mcp_host = MCPHost(settings)
     try:
         await runtime.start()
         log.info("llama-server ready: %s", json.dumps(runtime.status(), ensure_ascii=False))
@@ -85,6 +94,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await runtime.stop()
+        await mcp_host.stop()
 
 
 class RevalidateAssets:
@@ -155,6 +165,14 @@ class ChatRequest(BaseModel):
     messages: list[MessageIn] = Field(min_length=1, max_length=MAX_CHAT_MESSAGES)
     web_search: bool = False
     thinking: bool = False
+    # Capability switches. Every one of them is clamped in the handler below against
+    # what this model and this machine can actually do, for the same reason
+    # web_search is: a second tab with stale state, or a direct API call, would
+    # otherwise be able to switch on something the user never ticked.
+    use_memory: bool = False
+    use_think: bool = False
+    fs_read: bool = False
+    fs_write: bool = False
 
 
 class ModelSwitchIn(BaseModel):
@@ -238,7 +256,19 @@ def sse(event_type: str, data: dict) -> str:
 @app.get("/api/status")
 async def status() -> JSONResponse:
     assert runtime is not None
-    return JSONResponse(runtime.status())
+    assert mcp_host is not None
+    body = runtime.status()
+    # available() spawns nothing: this endpoint is polled every 15 s, and a capability
+    # nobody has switched on must not cost a resident Node process. The detail is a
+    # Chinese reason for the tooltip when it is off, and the server's own name and
+    # version once it has been started — the same shape runtime.status() uses.
+    mcp_ok, mcp_why = mcp_host.available()
+    body["mcp"] = mcp_ok
+    body["mcp_detail"] = mcp_why or mcp_host.detail
+    memory_on = get_settings().memory_enabled
+    body["memory"] = memory_on
+    body["memory_detail"] = "" if memory_on else "已在 .env 中关闭（MEMORY_ENABLED=false）"
+    return JSONResponse(body)
 
 
 @app.get("/api/stats")
@@ -461,6 +491,42 @@ async def session_delete(session_id: str) -> JSONResponse:
     return JSONResponse({"ok": True})
 
 
+@app.get("/api/memory")
+async def memory_list() -> JSONResponse:
+    """Every memory, newest first.
+
+    A store the model can write to has to be one the user can read and empty, or it is
+    not auditable. Same offloading as the session routes: memory_store is synchronous
+    and holds a threading.Lock.
+    """
+    records = await run_in_threadpool(list_memories, get_settings().memory_file)
+    return JSONResponse({"items": records, "count": len(records)})
+
+
+@app.delete("/api/memory/{memory_id}")
+async def memory_delete(memory_id: str) -> JSONResponse:
+    try:
+        # The id arrives from the browser and memory_store checks it against
+        # MEMORY_ID_RE before anything else, raising MemoryStoreError if it is malformed.
+        deleted = await run_in_threadpool(delete_memory, get_settings().memory_file, memory_id)
+    except MemoryStoreError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(500, f"删除记忆失败：{exc}") from exc
+    if not deleted:
+        raise HTTPException(404, "记忆不存在")
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/memory")
+async def memory_clear() -> JSONResponse:
+    try:
+        cleared = await run_in_threadpool(clear_memories, get_settings().memory_file)
+    except MemoryStoreError as exc:
+        raise HTTPException(500, str(exc)) from exc
+    return JSONResponse({"ok": True, "cleared": cleared})
+
+
 @app.post("/api/documents")
 async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
     """Parse an uploaded file and hand the extracted text back to the browser."""
@@ -588,22 +654,102 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     # tools cannot search. Clamping here rather than trusting the browser covers a
     # second tab with stale state and any direct API call.
     use_search = req.web_search and runtime.supports_tools
+    model = runtime.model_path.name
     if req.web_search and not use_search:
-        log.warning("ignoring web_search: %s does not support tool calls", runtime.model_path.name)
+        log.warning("ignoring web_search: %s does not support tool calls", model)
 
     s = get_settings()
+    assert mcp_host is not None
+
+    # Every capability below rides the same tool-calling channel, so each inherits the
+    # same clamp, and each refusal is logged for the same reason the search one is: a
+    # switch that silently does nothing is indistinguishable from a broken one.
+    mcp_ok, mcp_why = mcp_host.available()
+    use_memory = req.use_memory and s.memory_enabled and runtime.supports_tools
+    use_think = req.use_think and runtime.supports_tools
+    use_fs_read = req.fs_read and mcp_ok and runtime.supports_tools
+    # Writing is an addition to reading, not a capability of its own. The checkbox is
+    # disabled in the UI unless reading is ticked, and clamped the same way here.
+    use_fs_write = req.fs_write and use_fs_read
+    if req.use_memory and not use_memory:
+        log.warning(
+            "ignoring use_memory: %s",
+            "MEMORY_ENABLED=false" if not s.memory_enabled else f"{model} does not support tool calls",
+        )
+    if req.use_think and not use_think:
+        log.warning("ignoring use_think: %s does not support tool calls", model)
+    if req.fs_read and not use_fs_read:
+        log.warning("ignoring fs_read: %s", mcp_why or f"{model} does not support tool calls")
+    if req.fs_write and not use_fs_write:
+        log.warning("ignoring fs_write: the file capability is off, and writing depends on it")
+
+    # The filesystem schemas come from the server itself rather than from a copy kept
+    # here, so an upstream release cannot desync the two. Fetched only when the box is
+    # ticked, because this is the call that lazily starts the Node child (0.197 s warm,
+    # 6.1 s cold, measured). A failure degrades to "chat without files" and says so —
+    # it must not cost the user the whole request.
+    fs_raw: list[dict] = []
+    mcp_note = ""
+    if use_fs_read:
+        try:
+            fs_raw = await mcp_host.tools()
+        except Exception as exc:  # noqa: BLE001 - MCPError, plus anything a dead child raises
+            log.warning("filesystem tools unavailable, continuing without them: %s", exc)
+            use_fs_read = use_fs_write = False
+            mcp_note = f"文件工具本轮不可用，已跳过：{exc}"
+
+    tools = build_tools(
+        search=use_search,
+        memory=use_memory,
+        think=use_think,
+        fs_read=use_fs_read,
+        fs_write=use_fs_write,
+        fs_raw=fs_raw,
+    )
+    # The runner is told exactly which filesystem tools were offered, and which of
+    # those write, so its own gate and its audit log cannot disagree with the schemas
+    # in the payload.
+    fs_readable = fs_tool_names(fs_raw, False)
+    fs_all = fs_tool_names(fs_raw, True)
+    runner = ToolRunner(
+        s,
+        mcp_host,
+        s.memory_file,
+        tools,
+        fs_tools=(fs_all if use_fs_write else fs_readable) if use_fs_read else set(),
+        fs_write_tools=(fs_all - fs_readable) if use_fs_write else set(),
+    )
+    prompt = effective_prompt(
+        s.system_prompt,
+        {
+            key
+            for key, on in (
+                ("memory", use_memory),
+                ("think", use_think),
+                ("fs_read", use_fs_read),
+                ("fs_write", use_fs_write),
+            )
+            if on
+        },
+        # The same list the MCP child was started with, so what the prompt promises
+        # and what the sandbox enforces cannot drift apart. Only read when fs_read is
+        # on — that is the only line with a placeholder in it.
+        fs_roots=s.fs_roots,
+    )
+
     # The server's own figure, not a local guess: /props reports what llama-server
     # actually allocated for the slot, which n_ctx_overrides only approximates.
     n_ctx = int(runtime.status().get("n_ctx") or s.n_ctx_for(runtime.model_path))
     reserve = s.thinking_max_tokens if req.thinking else s.max_tokens
-    # use_search, not req.web_search: llama-server only receives the schemas when the
-    # model can actually call them (llm.py:140-142), so charging a tool-less model for
-    # 807 estimated tokens it will never see is waste — and use_search above has just
-    # been clamped on runtime.supports_tools.
+    # `prompt` and `tools` — the same two objects that go on the wire — rather than
+    # s.system_prompt and a module constant. That is the drift build_tools() exists to
+    # remove: charging for 2 tools while sending 11 would let fit_budget admit history
+    # that does not fit, and charging for prompt lines that are not enabled would waste
+    # the budget they were never going to use.
     if history:
         safety = budget_safety(
-            s.system_prompt,
-            json.dumps(TOOLS, ensure_ascii=False) if use_search else "",
+            prompt,
+            json.dumps(tools, ensure_ascii=False) if tools else "",
             len(history),
         )
         fitted, notes = fit_budget(history, n_ctx, reserve, safety)
@@ -623,17 +769,15 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         # last would ever be read. Gated on `fitted` because the notes describe
         # trimming that happened; when nothing will be sent at all, the error event
         # below carries the same text and emitting both shows it to the user twice.
-        if notes and fitted:
-            yield sse("status", {"text": " ".join(notes)})
+        if fitted and (mcp_note or notes):
+            yield sse("status", {"text": " ".join(x for x in (mcp_note, *notes) if x)})
         if not fitted:
             # Either even the last message will not fit, or every turn was filtered
             # out as empty. notes[0] is the reason computed for exactly that case.
             yield sse("error", {"text": notes[0] if notes else "上下文长度不足，请新建对话。"})
             return
         try:
-            async for event in stream_chat(
-                get_settings(), fitted, use_search, req.thinking
-            ):
+            async for event in stream_chat(s, fitted, tools, runner, req.thinking):
                 yield sse(event["type"], event)
         except Exception as exc:  # noqa: BLE001 - surface any failure to the browser
             log.exception("chat failed")

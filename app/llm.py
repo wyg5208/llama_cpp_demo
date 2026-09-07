@@ -1,8 +1,13 @@
 """Streaming OpenAI-compatible client for llama-server, with a tool-calling loop.
 
-Tool-call deltas are accumulated across chunks; when the model asks for
-web_search we run it and continue the same completion, so the final answer is
-still streamed token by token.
+Tool-call deltas are accumulated across chunks; when the model asks for a tool we
+run it and continue the same completion, so the final answer is still streamed token
+by token.
+
+Web search runs here because it owns `sources`, `seen_urls` and the `sources` event —
+those belong to the answer rather than to a tool result. Every other tool is handed to
+the ToolRunner the caller built, and its events are forwarded untouched: the browser
+already renders `status` and `reasoning`, so a new tool costs no new front-end code.
 """
 
 from __future__ import annotations
@@ -10,13 +15,12 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 import httpx
 
 from .config import Settings
 from .search import (
-    TOOLS,
     SearchResult,
     fetch_url,
     format_for_model,
@@ -24,7 +28,15 @@ from .search import (
     web_search,
 )
 
+if TYPE_CHECKING:  # tools.py assembles what this module only forwards
+    from .tools import ToolRunner
+
 log = logging.getLogger(__name__)
+
+# The two tools this module runs itself. The names must match search.py's schemas;
+# build_tools() includes them only when search is on, which is how `search_on` below
+# is derived rather than passed in as a second boolean that could disagree.
+_SEARCH_TOOLS = frozenset({"web_search", "fetch_url"})
 
 
 @dataclass
@@ -109,11 +121,25 @@ class _ToolCallBuffer:
 async def stream_chat(
     settings: Settings,
     messages: list[ChatMessage],
-    use_search: bool,
+    tools: list[dict],
+    runner: ToolRunner,
     think: bool | None = None,
 ) -> AsyncIterator[dict]:
-    """Yield UI events: status / sources / reasoning / delta / done / error."""
+    """Yield UI events: status / sources / reasoning / delta / done / error.
+
+    `tools` is the very list build_tools() assembled, and main.py charges that same
+    object to budget_safety(), so what is sent and what is paid for cannot drift.
+    `runner` executes everything that is not web search.
+    """
     payload_messages = to_openai_messages(messages, settings.system_prompt)
+    # Derived from `tools` rather than passed in beside them. main.py has already
+    # clamped search on runtime.supports_tools before assembling, so a second boolean
+    # could only disagree with the first. Deriving it is what makes the switch honest:
+    # with search off, a model that hallucinates web_search falls through to the runner
+    # and is told there is no such tool, instead of going online through a box the user
+    # unticked.
+    offered = {str(t.get("function", {}).get("name", "")) for t in tools}
+    search_on = bool(offered & _SEARCH_TOOLS)
     sources: list[SearchResult] = []
     seen_urls: set[str] = set()
     searched: set[str] = set()
@@ -137,8 +163,8 @@ async def stream_chat(
                 "max_tokens": settings.thinking_max_tokens if thinking else settings.max_tokens,
                 "chat_template_kwargs": {"enable_thinking": thinking},
             }
-            if use_search:
-                payload["tools"] = TOOLS
+            if tools:
+                payload["tools"] = tools
                 payload["tool_choice"] = "auto"
 
             try:
@@ -193,7 +219,7 @@ async def stream_chat(
                             "id": call["id"] or f"call_{n}",
                             "type": "function",
                             "function": {
-                                "name": call["name"] or "web_search",
+                                "name": _effective_name(call["name"], search_on),
                                 "arguments": call["arguments"] or "{}",
                             },
                         }
@@ -204,13 +230,16 @@ async def stream_chat(
             text_parts.clear()
 
             for n, call in enumerate(tool_calls):
+                name = _effective_name(call["name"], search_on)
                 args = _parse_args(call["arguments"])
 
-                if call["name"] == "fetch_url":
+                if search_on and name == "fetch_url":
                     url = str(args.get("url") or "").strip()
                     yield {"type": "status", "text": f"正在读取网页：{url[:90]}"}
                     content = await fetch_url(url)
-                else:
+                elif search_on and name == "web_search":
+                    # _effective_name has already folded a nameless call in here,
+                    # which is what this branch has always done.
                     query = str(args.get("query") or "").strip() or _fallback_query(messages)
                     if query in searched:
                         yield {"type": "status", "text": f"该关键词已检索过：{query}"}
@@ -252,6 +281,18 @@ async def stream_chat(
                             )
                         else:
                             content = format_for_model([], start_index)
+                else:
+                    # Everything that is not search: remember / recall, think, and the
+                    # MCP filesystem tools. The runner's last event is always the
+                    # tool_result; whatever it emits before that is forwarded as-is, so
+                    # a new tool needs no new branch here and no new rendering in the
+                    # browser.
+                    content = ""
+                    async for event in runner.run(name, args):
+                        if event.get("type") == "tool_result":
+                            content = str(event.get("content", ""))
+                        else:
+                            yield event
 
                 payload_messages.append(
                     {
@@ -261,7 +302,12 @@ async def stream_chat(
                     }
                 )
         else:
-            yield {"type": "status", "text": "已达到最大检索轮次，基于现有信息作答。"}
+            # The rounds are shared by every tool now, not just search: think spends
+            # one per step on purpose, so this fires for a long chain of thought too.
+            yield {
+                "type": "status",
+                "text": f"已达到最大工具轮次（{settings.max_tool_rounds}），基于现有信息作答。",
+            }
 
     yield {
         "type": "done",
@@ -281,6 +327,16 @@ def _parse_args(raw_arguments: str) -> dict:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _effective_name(raw_name: str, search_on: bool) -> str:
+    """The name to dispatch on, and the one echoed back into the assistant turn.
+
+    A streamed tool call can arrive with no name at all. With search on that has always
+    been read as web_search; the dispatch and the echoed history have to agree, or the
+    next turn is a conversation where the model asked for one tool and got another.
+    """
+    return raw_name or ("web_search" if search_on else "")
 
 
 def _fallback_query(messages: list[ChatMessage]) -> str:
