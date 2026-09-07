@@ -20,6 +20,7 @@ from .documents import (
     DOC_MAX_CHARS,
     MAX_DOC_BYTES,
     DocumentError,
+    budget_safety,
     check_filename,
     fit_budget,
     parse_document,
@@ -27,6 +28,7 @@ from .documents import (
 from .llm import ChatMessage, stream_chat
 from .models import find_model, save_active_model, scan_models
 from .runtime import LlamaRuntime, RuntimeUnavailable
+from .search import TOOLS
 from .settings_store import (
     EDITABLE,
     SettingsPatch,
@@ -459,6 +461,29 @@ async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
     return JSONResponse(parsed.to_dict())
 
 
+def _is_sendable(m: MessageIn) -> bool:
+    """Mirror of isSendable() in static/app.js — read the comment there first.
+
+    A turn that produced no words must not go back on the wire: the model is handed
+    […, user X, assistant "", user X] and answers with an immediate EOS, which the
+    user experiences as the conversation having stopped working. Clamped here as
+    well as in the browser for the same reason as web_search below — a second tab
+    with stale state, or a direct API call, would otherwise still send it.
+
+    Only the empty-content half of the rule can live here. `error` is not a field on
+    MessageIn and wireMessages() never puts it on the wire, and recognising our own
+    "请求失败：" prefix back out of the content would be brittle; so error turns are
+    filtered client-side only. That still self-heals, because toStored persists
+    `error` and fromStored restores it, so a resumed session filters them too.
+
+    A user turn survives on attachments alone: send() refuses a text-less turn, but
+    one restored from the archive may be pixels-only.
+    """
+    if m.role == "user":
+        return bool(m.content.strip()) or bool(m.documents) or bool(m.images)
+    return bool(m.content.strip())
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest) -> StreamingResponse:
     assert runtime is not None
@@ -482,6 +507,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             documents=[(d.name, d.text) for d in m.documents],
         )
         for m in req.messages
+        if _is_sendable(m)
     ]
 
     # Search is implemented as a tool call, so a model whose template cannot call
@@ -496,21 +522,38 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     # actually allocated for the slot, which n_ctx_overrides only approximates.
     n_ctx = int(runtime.status().get("n_ctx") or s.n_ctx_for(runtime.model_path))
     reserve = s.thinking_max_tokens if req.thinking else s.max_tokens
-    fitted, notes = fit_budget(history, n_ctx, reserve)
-    if notes:
-        log.info(
-            "context trimmed %d -> %d messages: %s", len(history), len(fitted), " ".join(notes)
+    # use_search, not req.web_search: llama-server only receives the schemas when the
+    # model can actually call them (llm.py:140-142), so charging a tool-less model for
+    # 807 estimated tokens it will never see is waste — and use_search above has just
+    # been clamped on runtime.supports_tools.
+    if history:
+        safety = budget_safety(
+            s.system_prompt,
+            json.dumps(TOOLS, ensure_ascii=False) if use_search else "",
+            len(history),
         )
+        fitted, notes = fit_budget(history, n_ctx, reserve, safety)
+        if notes:
+            log.info(
+                "context trimmed %d -> %d messages: %s", len(history), len(fitted), " ".join(notes)
+            )
+    else:
+        # Every turn was filtered out as empty. fit_budget([]) would return ([], [])
+        # with no notes, so the `if not fitted` branch below would blame the context
+        # window for what is really an empty conversation.
+        fitted, notes = [], ["上一轮回复为空，本轮没有可发送的内容，请重新提问。"]
 
     async def events() -> AsyncIterator[str]:
         # One joined line rather than an event per note: the UI keeps a single
         # status slot, so separate events would overwrite each other and only the
-        # last would ever be read.
-        if notes:
+        # last would ever be read. Gated on `fitted` because the notes describe
+        # trimming that happened; when nothing will be sent at all, the error event
+        # below carries the same text and emitting both shows it to the user twice.
+        if notes and fitted:
             yield sse("status", {"text": " ".join(notes)})
         if not fitted:
-            # fit_budget empties the list only when even the last message will not
-            # fit; notes[0] is the reason it computed for exactly that case.
+            # Either even the last message will not fit, or every turn was filtered
+            # out as empty. notes[0] is the reason computed for exactly that case.
             yield sse("error", {"text": notes[0] if notes else "上下文长度不足，请新建对话。"})
             return
         try:

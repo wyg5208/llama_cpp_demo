@@ -59,7 +59,30 @@ ZIP_MAX_TOTAL_BYTES = 400_000_000
 # "this is data, not instructions" note).
 DOC_WRAPPER_TOKENS = 40
 
+# fit_budget's `safety` default, for callers with nothing to measure. /api/chat
+# always passes budget_safety() instead, because 1024 was measured 80 tokens short
+# of the system prompt (297) plus the tool schemas (807) on their own — before a
+# single message or a template token was counted.
 CTX_SAFETY_TOKENS = 1024
+
+# Chat-template markup around each message: gemma wraps a turn in
+# <start_of_turn>role\n … <end_of_turn>\n, Qwen in <|im_start|>…<|im_end|>. Both
+# come to roughly 5 special/whitespace tokens; rounded up per this file's rule of
+# over-estimating rather than fitting.
+PER_MESSAGE_TEMPLATE_TOKENS = 8
+
+# Catch-all for tokenizer divergence (estimate_tokens runs 1.36-1.90x high, so the
+# spread is wide), BOS/EOS, and a SYSTEM_PROMPT the user has lengthened in the
+# settings panel. A judgment value, not a measured one.
+TEMPLATE_SLACK_TOKENS = 512
+
+# Per image, charged in _msg_tokens. app.js downscales uploads to MAX_EDGE 1568 —
+# gemma-3's own preprocessing cap — and at that size gemma-3 emits 256 tokens per
+# 768x768 tile with up to 5 tiles under pan-and-scan (1280), while Qwen2-VL works
+# out to 56^2/4 = 784. 1280 covers both with margin. An estimate, not a
+# measurement: to measure it, diff the prompt token counts of a with-image and a
+# without-image request in runtime/llama-server.log — no inference slot needed.
+TOKENS_PER_IMAGE = 1280
 
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
@@ -555,6 +578,10 @@ def _msg_tokens(msg) -> int:
     total = estimate_tokens(getattr(msg, "content", "") or "")
     for name, text in getattr(msg, "documents", None) or []:
         total += _doc_tokens(name, text)
+    # On the wire only the newest user turn carries pixels (isLastUser && vision in
+    # app.js), so this fires on at most one message per request — but a direct API
+    # call can put them anywhere, and MAX_IMAGES_PER_MESSAGE allows 4 per message.
+    total += len(getattr(msg, "images", None) or []) * TOKENS_PER_IMAGE
     return total
 
 
@@ -564,6 +591,30 @@ def _total(msgs) -> int:
 
 def _stub(name: str) -> str:
     return f"【附件「{name}」的正文已省略，以控制上下文长度】"
+
+
+def budget_safety(system_prompt: str, tools_json: str, n_messages: int) -> int:
+    """What this request costs in prompt tokens beyond the messages fit_budget sees.
+
+    to_openai_messages prepends the system prompt (llm.py:68-69) and llama-server
+    wraps the list in tool schemas and chat-template markup, so none of the three
+    are in `messages` and none are counted by _msg_tokens. `tools_json` is the
+    serialised schema, or "" when the model cannot call tools — the schemas are
+    only sent inside `if use_search:` (llm.py:140-142), so charging a tool-less
+    model for them would throw the tokens away.
+
+    `n_messages` is the PRE-trim count: Stage C may drop turns after this is
+    computed, so the template term over-counts. That is the safe direction.
+
+    Pure and import-free like the rest of this module's budget layer, so it stays
+    directly unit-testable.
+    """
+    return (
+        estimate_tokens(system_prompt)
+        + (estimate_tokens(tools_json) if tools_json else 0)
+        + n_messages * PER_MESSAGE_TEMPLATE_TOKENS
+        + TEMPLATE_SLACK_TOKENS
+    )
 
 
 def fit_budget(messages, n_ctx: int, reserve: int, safety: int = CTX_SAFETY_TOKENS):
@@ -582,9 +633,14 @@ def fit_budget(messages, n_ctx: int, reserve: int, safety: int = CTX_SAFETY_TOKE
     """
     budget = n_ctx - reserve - safety
     if budget <= 0:
+        # The third suggestion is new with budget_safety(): safety is now dominated
+        # by SYSTEM_PROMPT, which the user can lengthen in the settings panel, so an
+        # over-long prompt can drive the budget to zero on a window that was fine
+        # before — and neither max_tokens nor a bigger model is the obvious fix.
         return [], [
             f"上下文预算不足：模型上下文 {n_ctx} tokens，扣除本次回复保留的 {reserve} "
-            f"与安全边际 {safety} 后没有剩余。请在设置里调小 max_tokens，或换用上下文更大的模型。"
+            f"与安全边际 {safety} 后没有剩余。请在设置里调小 max_tokens，或换用上下文更大的模型，"
+            f"或缩短系统提示词。"
         ]
 
     msgs = list(messages)

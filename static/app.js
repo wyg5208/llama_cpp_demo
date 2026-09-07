@@ -888,10 +888,46 @@ inputEl.addEventListener("paste", (e) => {
 // conversation would otherwise become permanently unsendable.
 const MAX_CHAT_MESSAGES = 200;
 
+/* A turn that produced no words must not go back on the wire. Five paths leave an
+   assistant bubble empty: an abort via 停止 / Enter-mid-stream / 新建对话 (send()'s
+   catch skips AbortError, so neither content nor error is set), a stream that ends
+   with no delta, a thinking-only turn, a sources-only turn, a done-only turn — plus
+   content that is whitespace, which nothing here ever trims. Replaying one hands the
+   model […, user X, assistant "", user X], and it answers with an immediate EOS.
+   Measured on the session that reported 罢工: GENERATED 1 tokens, ctx=5972,
+   truncated=0 — 4.5% of the window used, so context was never the constraint.
+
+   error turns go too: their content is our own "请求失败：…", and the model learns to
+   say it. The bubble keeps its red styling, which renderMessage drives off msg.error.
+
+   Filtered HERE and nowhere else. The bubble and the archive both keep the record, so
+   an already-broken session self-heals on its next send with no data migration.
+
+   A user turn survives on attachments alone: send() refuses a text-less turn, but one
+   restored from the archive may be pixels-only. */
+function isSendable(msg) {
+  const text = (msg.content || "").trim();
+  if (msg.role === "user") {
+    return Boolean(text) || (msg.documents || []).length > 0 || (msg.images || []).length > 0;
+  }
+  return !msg.error && Boolean(text);
+}
+
 function wireMessages() {
-  const out = messages.slice(-MAX_CHAT_MESSAGES);
+  // Slice first, then filter: MAX_CHAT_MESSAGES guards the array the server validates,
+  // and filtering can only ever shorten it. Both `out` and the index `i` below must come
+  // from the same array or they drift apart.
+  const out = messages.slice(-MAX_CHAT_MESSAGES).filter(isSendable);
   return out.map((msg, i) => {
-    const isLastUser = msg.role === "user" && i === out.length - 2;
+    // out.length - 1, NOT - 2. send() pushes the empty "正在思考…" placeholder before
+    // this runs, and isSendable removes it, so the newest user turn is the LAST element
+    // here. Leaving -2 hands the pixels to the turn before it — an assistant turn, whose
+    // isLastUser is false, so the images go nowhere at all and vision silently stops
+    // working. That -1 is safe because it is an invariant, not a hope: send() returns
+    // unless inputEl.value.trim() is non-empty, so the user turn it pushes always passes
+    // isSendable, and this function has exactly one call site. Hence out.length >= 1 and
+    // out[out.length - 1].role === "user".
+    const isLastUser = msg.role === "user" && i === out.length - 1;
     // Only the newest user turn keeps its pixels; re-sending older images
     // would re-run the vision encoder over the whole history every turn.
     // The vision check matters after switching to a text-only model, whose
