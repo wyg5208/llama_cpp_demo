@@ -34,6 +34,7 @@ import fnmatch
 import logging
 import os
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Sequence
 
@@ -66,6 +67,14 @@ MAX_THOUGHTS = 16
 # recall returns this many notes. Small on purpose — the store holds up to 500 and
 # dumping them is the failure memory_store.search_memories exists to avoid.
 RECALL_LIMIT = 5
+
+# One save_document call. MAX_TOKENS already bounds what a model can generate, so this
+# only fires if the user raises MAX_TOKENS a long way — but an artifact crosses two
+# boundaries that need a definite ceiling regardless of .env: it is relayed whole in a
+# single SSE event, and it is stored whole in runtime/history/*.json. MAX_ARTIFACT_NAME
+# matches app.js's TITLE_CHARS so the two filename sanitizers cannot disagree on length.
+MAX_ARTIFACT_CHARS = 40_000
+MAX_ARTIFACT_NAME = 40
 
 
 # --- filesystem tool policy ---------------------------------------------------
@@ -389,6 +398,103 @@ THINK_TOOL = {
 MEMORY_TOOLS = [REMEMBER_TOOL, RECALL_TOOL]
 
 
+SAVE_DOCUMENT = "save_document"
+
+# One semantic for all five: `content` is always Markdown source and `format` only
+# decides which file the browser downloads. app.js already feeds Markdown to every one
+# of the five paths (saveBlob for md, exportHtmlDocument for html, toCsv — which parses
+# Markdown tables — for csv, and blocksFromMarkdown -> /api/export for pdf and docx), so
+# this needs no new renderer and, more importantly, no server-side one: export.py refuses
+# md/html/csv on purpose and that refusal stays intact. A bonus the model does not need
+# to know about: an archived artifact is Markdown, so it can be re-downloaded after a
+# refresh in a format other than the one that was asked for.
+ARTIFACT_FORMATS = ("md", "html", "csv", "pdf", "docx")
+
+SAVE_DOCUMENT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": SAVE_DOCUMENT,
+        # Behavioural guidance ("do not repeat the document in your reply") lives in
+        # PROMPT_LINES["doc_gen"], not here: this description measured 591 tokens with it
+        # and 504 without, and the prompt line carries it on every request anyway.
+        "description": (
+            "把一整篇文档交给用户下载。用户要文件时（导出、生成报告、做成表格）用它。\n"
+            "content 一律是完整的 Markdown 源文本，五种格式都是；format 只决定下载成哪种文件。"
+            "csv 需要文档里有 Markdown 表格才有内容可转。\n"
+            "一次调用只生成一份，超长会被整份拒绝。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "只写文件名，不要带路径，例如「周报.md」。",
+                },
+                "format": {
+                    "type": "string",
+                    "enum": list(ARTIFACT_FORMATS),
+                    "description": "下载成哪种文件。内容都是 Markdown，这里只选容器。",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "文档标题，用作 pdf 元数据与 html 的 title。可省略。",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "完整的 Markdown 源文本，一份到底。",
+                },
+            },
+            "required": ["filename", "format", "content"],
+        },
+    },
+}
+
+# Mirrors app.js's FS_UNSAFE / FS_RESERVED. Two copies of one rule is a drift risk, and
+# it is accepted for the same reason EXPORT_CSS's three copies are: sharing them would
+# need a build step this app does not have. The browser runs its own sanitiser on the way
+# to a.download as well, so neither copy is the only thing standing.
+_FS_UNSAFE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+_FS_RESERVED = re.compile(r"^(con|prn|aux|nul|com[1-9]|lpt[1-9])$", re.I)
+
+
+def safe_artifact_name(name: Any, fmt: str) -> str:
+    """A model-supplied filename made safe to hand to a browser's download.
+
+    Sanitised here and not only in the browser because /api/chat is reachable without
+    one — the same reason StoredSource._check_url holds a URL to its http(s) rule on the
+    server — and because the name is archived into runtime/history/*.json, which should
+    not store something that needs sanitising every time it is read back.
+
+    The rules are measured, not theoretical: the real session index holds a title
+    starting '> **【角色设定】**：…', and both > and * are illegal in a Windows filename.
+    """
+    extension = fmt if fmt in ARTIFACT_FORMATS else "md"
+    s = _FS_UNSAFE.sub("_", str(name or ""))
+    # Killing the separators is what kills traversal: "../../etc/passwd" arrives here and
+    # leaves as ".._.._etc_passwd", which is an odd filename and nothing more.
+    s = s.replace("..", "_")
+    # Windows silently strips leading and trailing dots and spaces, so "…" is not the
+    # name that lands on disk.
+    s = s.strip(". \t\r\n")
+    stem, dot, _ = s.rpartition(".")
+    if dot:
+        # Drop the existing suffix whether or not it matches, because exactly one is
+        # appended below. Matching also normalises its case ("周报.PDF" -> "周报.pdf");
+        # mismatching matters more — the bytes are decided by `fmt`, and a file called
+        # report.txt that is really a PDF fails confusingly. Measured: without this the
+        # matching case came back as "周报.PDF.pdf".
+        s = stem or s
+    s = s[:MAX_ARTIFACT_NAME].strip(". \t\r\n")
+    if not s:
+        s = datetime.now(timezone.utc).astimezone().strftime("文档-%Y-%m-%d-%H%M")
+    # A device name is reserved regardless of extension, so "con.md" is still bad:
+    # Windows resolves a path component to a device by the part before the first dot.
+    # Hence the stem, not the whole string, against an anchored pattern.
+    if _FS_RESERVED.match(s.split(".")[0]):
+        s = f"_{s}"
+    return f"{s}.{extension}"
+
+
 # --- MCP schema conversion ----------------------------------------------------
 
 
@@ -449,6 +555,7 @@ def build_tools(
     search: bool = False,
     memory: bool = False,
     think: bool = False,
+    doc_gen: bool = False,
     fs_read: bool = False,
     fs_write: bool = False,
     fs_raw: list[dict] | None = None,
@@ -459,12 +566,16 @@ def build_tools(
     addition to it, and the checkbox in the UI is disabled unless read is ticked.
     main.py clamps the same way, so the two agree by construction rather than by luck.
 
+    doc_gen is ordered before the filesystem layer because the filesystem layer is the
+    one whose size varies with what the MCP server reports, and a varying tail keeps the
+    prefix of this list stable — which is what llama-server's prompt-prefix cache wants.
+
     Cost, measured with this repo's estimate_tokens over the JSON of the result:
-    search alone 807 tokens, the read-only filesystem layer 2,184 more, the writing
-    layer 1,361 more. On a 16384 window — what any GGUF missing from N_CTX_OVERRIDES
-    falls back to — everything at once is over 40% of the context before a single
-    message. That is why every capability here has its own checkbox and none is on by
-    default.
+    search alone 807 tokens, save_document 504 on its own, the read-only filesystem
+    layer 2,184 more, the writing layer 1,361 more. On a 16384 window — what any GGUF
+    missing from N_CTX_OVERRIDES falls back to — everything at once is over 40% of the
+    context before a single message. That is why every capability here has its own
+    checkbox and none is on by default.
     """
     tools: list[dict] = []
     if search:
@@ -473,12 +584,30 @@ def build_tools(
         tools.extend(MEMORY_TOOLS)
     if think:
         tools.append(THINK_TOOL)
+    if doc_gen:
+        tools.append(SAVE_DOCUMENT_TOOL)
     if fs_read:
         tools.extend(pick_fs_tools(fs_raw or [], allow_write=fs_write))
     return tools
 
 
 # --- system prompt ------------------------------------------------------------
+
+# The character budget doc_gen's line quotes to the model, and the one number here that
+# needs its derivation written down. MAX_TOKENS=2048 over a realistic Chinese report
+# (headings, bullets, a table, a code fence) measures 2,472 characters at 1.045
+# chars/token, and passing that text back as a JSON string argument costs a further 13.6%.
+# At face value that says ~1,900 net, so 2,400 is only defensible because estimate_tokens
+# is calibrated 1.36-1.90x HIGH against the gemma tokenizer (see its docstring): the
+# tightest of those ratios, on exactly the table-heavy text a report contains, buys back
+# ~2,900. Quoting the pessimistic 1,900 instead would tell the model to leave a quarter of
+# the window unused on every document.
+# It stays an approximation on purpose. The real figure doubles when 深度思考 is on (that
+# path uses MAX_THINKING_TOKENS=4096), a different model's tokenizer will not match those
+# ratios, and an exact per-request number would need a second placeholder threaded through
+# effective_prompt — precision the model cannot act on. When it does overrun, llm.py's
+# _truncation_note says so explicitly instead of leaving a blank reply.
+DOC_GEN_CHAR_HINT = 2_400
 
 # Appended per feature rather than folded into DEFAULT_SYSTEM_PROMPT, because a line
 # describing a capability the user has not enabled is tokens paid on every single turn
@@ -494,6 +623,13 @@ PROMPT_LINES = {
         f"遇到需要多步推理、比较、规划或自查的问题，用 think 工具把中间步骤写下来，"
         f"一次一步，想清楚再作答；think 会占用一次工具轮次，最多 {MAX_THOUGHTS} 步。"
         "闲聊、翻译、简单问答直接回答，不要用 think。"
+    ),
+    "doc_gen": (
+        "用户要文件时（导出、生成报告、做成表格），用 save_document 一次交出整篇："
+        "content 写完整的 Markdown 源文本，filename 只写文件名不带路径，一次调用只生成一份。"
+        f"内容大约以 {DOC_GEN_CHAR_HINT} 个中文字符为限，长文档请精炼分节，"
+        "写到一半被截断的话整份都作废。"
+        "调用之后不要在正文里重复整篇内容，一句话说明生成了什么即可。"
     ),
     # The only line with a placeholder, and the only one effective_prompt formats.
     # The allowed roots are runtime configuration and the model cannot guess an
@@ -622,6 +758,8 @@ class ToolRunner:
             return self._recall(args)
         if name == THINK:
             return self._think(args)
+        if name == SAVE_DOCUMENT:
+            return self._save_document(args)
         # Offered but nothing here runs it. llm.py intercepts search's two tools
         # before they reach the runner, so this is a wiring bug rather than a model
         # mistake — log it, and do not tell the model the tool does not exist while
@@ -721,6 +859,66 @@ class ToolRunner:
                 + (f"还可以再想 {left} 步；" if left else "步数已用完；")
                 + "想清楚了就直接作答。"
             ),
+        }
+
+    async def _save_document(self, args: dict) -> AsyncIterator[dict]:
+        content = str(args.get("content") or "")
+        fmt = str(args.get("format") or "").strip().lower()
+        # 120 because StoredArtifact.title is capped there: an over-long title must not
+        # turn "save this session" into a 422 after the user already has the file.
+        title = str(args.get("title") or "").strip()[:120]
+
+        if fmt not in ARTIFACT_FORMATS:
+            yield {
+                "type": "tool_result",
+                "content": (
+                    f"save_document 的 format 必须是 {'、'.join(ARTIFACT_FORMATS)} 之一，"
+                    f"收到的是「{fmt or '（空）'}」。没有生成文件，请修正后重试。"
+                ),
+            }
+            return
+        if not content.strip():
+            yield {
+                "type": "tool_result",
+                "content": "save_document 需要 content：一整篇 Markdown 源文本。空文档没有生成。",
+            }
+            return
+        if len(content) > MAX_ARTIFACT_CHARS:
+            yield {
+                "type": "tool_result",
+                "content": (
+                    f"文档太长（{len(content)} 字符，上限 {MAX_ARTIFACT_CHARS}），没有生成。"
+                    "请精炼内容后重试。"
+                ),
+            }
+            return
+
+        name = safe_artifact_name(args.get("filename"), fmt)
+        # No status event here, unlike _remember: there is nothing to await, and the chip
+        # the browser renders for this artifact is the feedback — a 「正在生成文档」 line
+        # would still be sitting in the bubble after the download finished.
+        #
+        # An `artifact` event, which llm.py forwards untouched and main.py relays verbatim
+        # (its SSE line is `sse(event["type"], event)`, so a new type needs no relay
+        # change — the same free ride `reasoning` got). The server renders nothing:
+        # export.py refuses md/html/csv on purpose, and all five browser paths already
+        # take Markdown source.
+        yield {
+            "type": "artifact",
+            "filename": name,
+            "format": fmt,
+            "title": title,
+            "content": content,
+            "chars": len(content),
+        }
+        # Deliberately tiny, and the reason is arithmetic rather than taste: run() charges
+        # every tool_result against MAX_TOOL_TOTAL_CHARS, so echoing the document back
+        # would spend a tenth of this request's entire tool budget on text the model wrote
+        # one round ago and still has in its own assistant turn. All it needs to know is
+        # that the file reached the user.
+        yield {
+            "type": "tool_result",
+            "content": f"已生成《{name}》（{fmt}，{len(content)} 字符），文件已交给用户下载。",
         }
 
     async def _filesystem(self, name: str, args: dict) -> AsyncIterator[dict]:

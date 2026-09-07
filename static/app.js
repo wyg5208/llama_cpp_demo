@@ -207,6 +207,8 @@ const fsReadToggle = $("fs-read");
 const FS_READ_TITLE = fsReadToggle.closest("label").title;
 const fsWriteToggle = $("fs-write");
 const FS_WRITE_TITLE = fsWriteToggle.closest("label").title;
+const docGenToggle = $("doc-gen");
+const DOC_GEN_TITLE = docGenToggle.closest("label").title;
 const newChatBtn = $("new-chat-btn");
 const copyBtn = $("copy-btn");
 const modelSelect = $("model-select");
@@ -254,7 +256,7 @@ const memoryRefreshBtn = $("memory-refresh");
 const memoryClearBtn = $("memory-clear");
 
 // One table drives both halves below, and names each toggle for the alerts that have
-// to say which boxes a lost capability closed. Six toggles spelled out twice is six
+// to say which boxes a lost capability closed. Seven toggles spelled out twice is seven
 // chances for the two to disagree about a key name, and a key savePrefs writes but
 // loadPrefs never reads is a preference that silently stops sticking with nothing
 // anywhere to say so. The first two key names predate this table and are kept
@@ -266,6 +268,7 @@ const PREF_TOGGLES = [
   ["useMemory", memoryToggle, "记忆"],
   ["fsRead", fsReadToggle, "文件"],
   ["fsWrite", fsWriteToggle, "写入"],
+  ["docGen", docGenToggle, "生成文档"],
 ];
 
 function loadPrefs() {
@@ -320,6 +323,14 @@ function toStored(msg) {
     documents: (msg.documents || []).map(stripDocStatus),
     reasoning: msg.reasoning || "",
     sources: msg.sources || [],
+    // Only the four fields StoredArtifact declares, for the reason stripDocStatus
+    // exists: an archived snapshot must not carry state that belongs to a live card.
+    artifacts: (msg.artifacts || []).map((a) => ({
+      filename: a.filename || "",
+      format: a.format || "md",
+      title: a.title || "",
+      content: a.content || "",
+    })),
     usage: msg.usage || "",
     error: Boolean(msg.error),
   };
@@ -334,6 +345,8 @@ function fromStored(raw) {
     documents: (raw.documents || []).map(stripDocStatus),
     reasoning: raw.reasoning || "",
     sources: raw.sources || [],
+    // Empty for any session archived before this existed, which is most of them.
+    artifacts: raw.artifacts || [],
     usage: raw.usage || "",
     error: Boolean(raw.error),
   };
@@ -740,6 +753,86 @@ function buildSources(sources) {
   return wrap;
 }
 
+/* One card per document the model generated. The 下载 button is the fallback for the
+   automatic download rather than a convenience on top of it: saveBlob clicks a
+   programmatic <a>, and a download with no user gesture behind it is exactly what a
+   browser is allowed to refuse. The card is also what makes an archived artifact
+   re-downloadable after a reload — in a format other than the one asked for, since what
+   is stored is the Markdown source and not the file. */
+function buildArtifacts(artifacts) {
+  if (!artifacts || !artifacts.length) return null;
+  const wrap = document.createElement("div");
+  wrap.className = "artifacts";
+  for (const a of artifacts) {
+    const card = document.createElement("div");
+    card.className = "artifact";
+
+    const name = document.createElement("span");
+    name.className = "artifact-name";
+    name.textContent = a.filename || "文档";
+    name.title = a.title || a.filename || "";
+
+    const meta = document.createElement("span");
+    meta.className = "artifact-meta";
+    meta.textContent = `${String(a.format || "md").toUpperCase()} · ${(a.content || "").length} 字符`;
+
+    // Written by a local note() rather than say(), which overwrites className and would
+    // strip .artifact-msg the first time a card reported something.
+    const msgEl = document.createElement("div");
+    msgEl.className = "artifact-msg";
+    msgEl.hidden = true;
+    const note = (text, kind) => {
+      msgEl.textContent = text;
+      msgEl.classList.toggle("err", kind === "err");
+      msgEl.classList.toggle("warn", kind === "warn");
+      msgEl.hidden = !text;
+    };
+    // A download the browser refused because no user gesture was behind it. The button is
+    // the way out, so the card says so rather than only reporting the failure.
+    if (a.problem) note(a.problem, "err");
+
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn btn-ghost artifact-dl";
+    btn.textContent = "下载";
+    btn.onclick = () => deliverArtifact(a, note);
+
+    card.append(name, meta, btn, msgEl);
+    wrap.append(card);
+  }
+  return wrap;
+}
+
+/* Markdown source -> a downloaded file, through the same exportMarkdown the 导出 dialog
+   uses. One implementation of that is the entire reason the browser does the rendering.
+
+   `note` is a card's (text, kind) callback, or null for the automatic delivery during a
+   stream, where the card that would show it is only built afterwards. Resolves "" on
+   success or when the reason already went to the card, and a Chinese explanation
+   otherwise, so the caller with no card can put it somewhere the user will see. */
+async function deliverArtifact(a, note = null) {
+  const fmt = a.format || "md";
+  // Any existing suffix comes off first, so re-downloading an archived card in another
+  // format does not produce "周报.md.pdf". sanitiseFilename runs again on a name the
+  // server already sanitised: it is idempotent, and this path is also reachable from a
+  // hand-edited archive.
+  const base = sanitiseFilename(String(a.filename || "").replace(/\.(md|html|csv|pdf|docx)$/i, ""));
+  const filename = `${base || "文档"}.${fmt}`;
+  try {
+    const ok = await exportMarkdown(a.content || "", fmt, a.title || "", filename, note);
+    // On success exportMarkdown has already written "已导出 …" through note, which
+    // replaces any earlier failure text — that confirmation is the only evidence the
+    // click worked, so it stays.
+    if (ok) return "";
+    // exportMarkdown already wrote the reason through note when there was one.
+    return note ? "" : `「${filename}」没有可下载的内容`;
+  } catch (err) {
+    const why = `「${filename}」下载失败：${err.message}`;
+    if (note) note(why, "err");
+    return why;
+  }
+}
+
 /* One collapsible card per attachment. An extracted body can run to 200k
    characters, so it is folded away by default and scrollable when opened —
    pouring it into the bubble would bury the question it was attached to. */
@@ -854,6 +947,11 @@ function renderMessage(msg) {
       bubble.prepend(status);
       msg._status = status;
     }
+    // Synchronous, like the reasoning card above it and unlike updateLive(): this is the
+    // path that puts the cards back after a reload, and requestAnimationFrame does not
+    // fire while the stream is still being read.
+    const artifacts = buildArtifacts(msg.artifacts);
+    if (artifacts) bubble.append(artifacts);
     const sources = buildSources(msg.sources || []);
     if (sources) bubble.append(sources);
     if (msg.usage) {
@@ -1288,6 +1386,7 @@ async function send() {
         // stale in a background tab costs a log line, not a capability.
         use_memory: memoryToggle.checked,
         use_think: thinkToggle.checked,
+        doc_gen: docGenToggle.checked,
         fs_read: fsReadToggle.checked,
         fs_write: fsWriteToggle.checked,
       }),
@@ -1366,6 +1465,29 @@ function handleEvent(name, data, assistant) {
     assistant.sources.push(...(data.items || []));
     assistant.status = "已获取检索结果，正在整理答案…";
     if (liveStatus) liveStatus.textContent = assistant.status;
+  } else if (name === "artifact") {
+    assistant.artifacts = assistant.artifacts || [];
+    assistant.artifacts.push(data);
+    // Rebuilt here rather than left to updateLive(), which defers to a
+    // requestAnimationFrame that does not fire while the reader loop is awaiting.
+    if (liveBubble) {
+      if (assistant._artifactsEl) assistant._artifactsEl.remove();
+      assistant._artifactsEl = buildArtifacts(assistant.artifacts);
+      if (assistant._artifactsEl) liveBubble.append(assistant._artifactsEl);
+    }
+    // Delivered on arrival, not at `done`: the model has produced the whole document by
+    // now, so hitting 停止 a moment later still leaves the file in the download folder.
+    // Not awaited either — a pdf/docx round trip through /api/export would stall the
+    // reader loop while the rest of the answer waits in the socket buffer.
+    deliverArtifact(data).then((problem) => {
+      if (!problem) return;
+      // Onto the artifact rather than the status line: send() clears assistant.status in
+      // its finally and renderMessageInto rebuilds the node, so a status written here
+      // would be gone before the user could read it. The card outlives both.
+      data.problem = problem;
+      // While streaming, the rebuild send() already has queued picks the card up.
+      if (!streaming) renderAll();
+    });
   } else if (name === "done") {
     const u = data.usage || {};
     if (u.prompt_tokens || u.completion_tokens) {
@@ -1418,6 +1540,7 @@ fsReadToggle.onchange = () => {
   syncControls(); // 写入's disabled state is derived from this box
 };
 fsWriteToggle.onchange = savePrefs;
+docGenToggle.onchange = savePrefs;
 
 /* ------------------------------------------------------------------ *
  * Session sidebar
@@ -2136,41 +2259,7 @@ async function runExport() {
 
   exportRunBtn.disabled = true;
   try {
-    if (fmt === "md") {
-      saveBlob(src, "text/markdown;charset=utf-8", filename);
-    } else if (fmt === "html") {
-      saveBlob(exportHtmlDocument(src, title || filename), "text/html;charset=utf-8", filename);
-    } else if (fmt === "csv") {
-      const csv = toCsv(src);
-      if (!csv) {
-        say("这段内容里没有 Markdown 表格，CSV 没有可导出的内容", "warn", exportMsgEl);
-        return;
-      }
-      saveBlob(CSV_BOM + csv, "text/csv;charset=utf-8", filename);
-    } else {
-      const resp = await fetch("/api/export", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ format: fmt, blocks: blocksFromMarkdown(src), title }),
-      });
-      if (!resp.ok) {
-        const detail = (await resp.json().catch(() => ({}))).detail;
-        // typeof guard, unlike the `detail || HTTP n` idiom elsewhere: ExportIn's
-        // Field(min_length/max_length) makes Pydantic answer 422 with a LIST, and
-        // a list is truthy, so that idiom would show "[object Object]".
-        throw new Error(typeof detail === "string" ? detail : `HTTP ${resp.status}`);
-      }
-      const pages = Number(resp.headers.get("X-Export-Pages") || 0);
-      const truncated = resp.headers.get("X-Export-Truncated") === "1";
-      saveBlob(await resp.blob(), resp.headers.get("Content-Type") || "", filename);
-      // The header is ASCII and the flag is what carries the meaning, because
-      // Starlette encodes headers as latin-1 and the warning is Chinese.
-      say(truncated
-        ? `已导出 ${filename}，内容超过 ${pages} 页上限，只保留了前面部分`
-        : `已导出 ${filename}${pages ? `（${pages} 页）` : ""}`, truncated ? "warn" : "ok", exportMsgEl);
-      return;
-    }
-    say(`已导出 ${filename}`, "ok", exportMsgEl);
+    await exportMarkdown(src, fmt, title, filename, (t, k) => say(t, k, exportMsgEl));
   } catch (err) {
     say(`导出失败：${err.message}`, "err", exportMsgEl);
   } finally {
@@ -2178,6 +2267,58 @@ async function runExport() {
     // transient disable. Export is deliberately usable mid-stream.
     exportRunBtn.disabled = !exportScopeEl.options.length;
   }
+}
+
+/* The only implementation of "Markdown source -> a downloaded file", shared by the
+   export dialog and by a document the model generated with save_document. Extracted
+   rather than copied, because one pipeline is the entire reason the browser does the
+   rendering: export.py refuses md/html/csv on purpose so that a second, server-side
+   Markdown implementation never grows here.
+
+   `report` is a (text, kind) callback, or null for a caller with nowhere to report. It is a
+   callback rather than an element because the two callers report differently: the export
+   dialog writes into its panel with say(), and an artifact card writes into its own
+   message element, where say() would overwrite the .artifact-msg class.
+   Resolves true when a file reached the browser. Throws only on a failed /api/export;
+   every other refusal says so through report and resolves false. */
+async function exportMarkdown(src, fmt, title, filename, report) {
+  const note = (text, kind) => { if (report) report(text, kind); };
+  if (fmt === "md") {
+    saveBlob(src, "text/markdown;charset=utf-8", filename);
+  } else if (fmt === "html") {
+    saveBlob(exportHtmlDocument(src, title || filename), "text/html;charset=utf-8", filename);
+  } else if (fmt === "csv") {
+    const csv = toCsv(src);
+    if (!csv) {
+      note("这段内容里没有 Markdown 表格，CSV 没有可导出的内容", "warn");
+      return false;
+    }
+    saveBlob(CSV_BOM + csv, "text/csv;charset=utf-8", filename);
+  } else {
+    const resp = await fetch("/api/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ format: fmt, blocks: blocksFromMarkdown(src), title }),
+    });
+    if (!resp.ok) {
+      const detail = (await resp.json().catch(() => ({}))).detail;
+      // typeof guard, unlike the `detail || HTTP n` idiom elsewhere: ExportIn's
+      // Field(min_length/max_length) makes Pydantic answer 422 with a LIST, and
+      // a list is truthy, so that idiom would show "[object Object]".
+      throw new Error(typeof detail === "string" ? detail : `HTTP ${resp.status}`);
+    }
+    const pages = Number(resp.headers.get("X-Export-Pages") || 0);
+    const truncated = resp.headers.get("X-Export-Truncated") === "1";
+    saveBlob(await resp.blob(), resp.headers.get("Content-Type") || "", filename);
+    // The header is ASCII and the flag is what carries the meaning, because
+    // Starlette encodes headers as latin-1 and the warning is Chinese.
+    note(truncated
+      ? `已导出 ${filename}，内容超过 ${pages} 页上限，只保留了前面部分`
+      : `已导出 ${filename}${pages ? `（${pages} 页）` : ""}`, truncated ? "warn" : "ok");
+    return true;
+  }
+  note(`已导出 ${filename}`, "ok");
+  return true;
 }
 
 for (const btn of sideLinks) btn.onclick = () => openPanel(btn.dataset.panel, btn);
@@ -2358,13 +2499,16 @@ function syncControls() {
   attachBtn.title = vision ? "上传图片" : "当前模型不支持图片理解";
   fileInput.disabled = !vision;
 
-  // All five ride the tool-calling channel, so the model's support for it is checked
+  // All six ride the tool-calling channel, so the model's support for it is checked
   // before any of their own reasons. `tools` is tri-state — null until the first
   // status arrives — and null gates them shut, which is the safe direction: for the
   // moment before we know, nothing that needs a capability can be switched on.
   const noTools = tools ? "" : "当前模型不支持工具调用";
   gate(searchToggle, SEARCH_TITLE, noTools && `${noTools}，联网检索不可用`);
   gate(thinkToggle, THINK_TITLE, noTools && `${noTools}，分步思考不可用`);
+  // 生成文档 has no reason of its own: unlike 记忆 it cannot be turned off in .env, and
+  // unlike 文件 it needs no child process. Model support is the whole of its gate.
+  gate(docGenToggle, DOC_GEN_TITLE, noTools && `${noTools}，生成文档不可用`);
   // === false rather than !: an absent field means "unknown" and must not gate, the
   // same fail-open applyTools has always used. /api/status does report both, so this
   // is about the shape of the check, not a case that can actually occur.

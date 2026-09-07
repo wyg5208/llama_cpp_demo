@@ -56,6 +56,10 @@
       <input type="checkbox" id="fs-write">
       <span>写入</span>
     </label>
+    <label class="toggle" title="让模型主动生成文件：它调用 save_document 交出一整篇 Markdown，浏览器按你选的格式（md/html/csv/pdf/docx）下载。文件落在浏览器的下载目录，不会写进本项目——这一点与「写入」不同。一次调用的长度受 MAX_TOKENS=2048 限制，约 2400 个中文字符；勾选「深度思考」时上限翻倍。默认关闭">
+      <input type="checkbox" id="doc-gen">
+      <span>生成文档</span>
+    </label>
     <button id="copy-btn" class="btn btn-ghost btn-icon" type="button" title="复制整个对话" aria-label="复制整个对话">
       <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
         <path fill="currentColor" d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/>
@@ -128,7 +132,7 @@
           <li>点击文档按钮上传 MD / PDF / DOCX / TXT / XLSX / PPTX，解析后可结合提问分析</li>
           <li>Enter 发送，Shift+Enter 换行</li>
           <li>开启「联网检索」后，模型会在需要时自行查证并附来源</li>
-          <li>「记忆」让模型记住你的偏好，「分步」让它分步推演；「文件」让它读本机文件，「写入」还允许改写——默认都是关的</li>
+          <li>「记忆」让模型记住你的偏好，「分步」让它分步推演；「文件」让它读本机文件，「写入」还允许改写；「生成文档」让它主动递一份文件给你——默认都是关的</li>
           <li>回答可以随时导出成 MD / HTML / CSV / PDF / DOCX，导出的是屏幕上已有的内容，不再调用模型</li>
         </ul>
       </div>
@@ -319,6 +323,29 @@
             几点限制：<code>CSV</code> 只导出正文里的 Markdown 表格，找不到表格时会提示而不是产生一个空文件；
             图片不会被导出；段落里的换行在渲染时就已经合并成空格，所以换行要紧时请选 <code>MD</code>，
             它逐字保存原文；PDF 与 DOCX 都保留可以点击的链接。
+          </p>
+
+          <h3>让模型生成文件</h3>
+          <p>
+            勾上顶栏的「生成文档」之后，模型可以调用 <code>save_document</code> 主动递一份文件给你，
+            不用你再去点导出。这和导出按钮是两件事：导出的是屏幕上已经有的内容，不花 token；
+            生成文档要模型把整篇写出来，既花 token 也占用那个唯一的推理 slot。
+            只是想留下已有的回答，用导出更快。
+          </p>
+          <p>
+            五种格式的内容都是 Markdown，<code>format</code> 只决定下载成哪种容器，
+            所以 <code>CSV</code> 同样需要文档里有 Markdown 表格。文件由浏览器下载，
+            落在浏览器的下载目录，<strong>不会写进本项目</strong>——那是「写入」开关做的事，两者互不相干。
+          </p>
+          <p>
+            一次调用的长度受 <code>MAX_TOKENS=2048</code> 限制，约 2400 个中文字符（勾选「深度思考」时用的是
+            <code>MAX_THINKING_TOKENS=4096</code>，能长一倍）。写超了不会得到一个残缺的文件：
+            应用会明确说明是长度上限截断的，并建议把要求拆小。想要更长的文档就在 <code>.env</code>
+            里调大 <code>MAX_TOKENS</code>，代价是每一轮回复的上限一起变大。
+          </p>
+          <p>
+            生成过的文档会在气泡里留一个卡片，刷新或重开会话之后还在，可以从那里重新下载，
+            并且可以换成当时没选的格式——因为存下来的是 Markdown 源文本，不是文件本身。
           </p>
         </section>
 

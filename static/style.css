@@ -37,7 +37,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  /* Wraps rather than clips: the bar now carries six capability toggles on top of
+  /* Wraps rather than clips: the bar now carries seven capability toggles on top of
      the brand, the meter and four buttons, and there is no width at which all of
      them fit beside a 264px sidebar. A clipped toggle is an unreachable one —
      these are browser-side preferences with no copy anywhere else in the UI. */
@@ -366,6 +366,32 @@ body {
 .doc-warn { padding: 0 10px 7px; font-size: 11.5px; color: var(--warn); }
 /* A body the server clipped still has to say so, or it reads as the whole file. */
 .doc-card.truncated .doc-badge { color: var(--warn); border-color: rgba(224, 179, 65, 0.45); }
+
+/* ---------- generated documents ---------- */
+/* Same top-border separator as .sources: both are attachments to the answer above
+   rather than part of its prose, and a card with no separator reads as more text. */
+.artifacts {
+  margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 8px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.artifact {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+  padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025); font-size: 12.5px;
+}
+/* anywhere rather than ellipsis: a sanitised name can be 40 characters of Chinese with
+   no break opportunity in it, and clipping the end hides the extension. */
+.artifact-name { min-width: 0; font-weight: 600; overflow-wrap: anywhere; }
+.artifact-meta {
+  flex: 0 0 auto; padding: 0 7px; border: 1px solid var(--border); border-radius: 999px;
+  font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums;
+}
+.artifact-dl { margin-left: auto; flex: 0 0 auto; padding: 3px 11px; font-size: 12px; }
+/* 100% so it takes its own line: sharing one with the name would squeeze the very text
+   that explains why the file did not arrive. */
+.artifact-msg { flex: 1 0 100%; font-size: 11.5px; color: var(--ok); }
+.artifact-msg.warn { color: var(--warn); }
+.artifact-msg.err { color: var(--err); }
 
 /* ---------- sources ---------- */
 .sources { margin-top: 10px; border-top: 1px dashed var(--border); padding-top: 8px; }

@@ -149,6 +149,10 @@ async def stream_chat(
     thinking = settings.enable_thinking if think is None else think
 
     async with httpx.AsyncClient(base_url=settings.base_url, timeout=timeout) as client:
+        # Hoisted out of the payload so _truncation_note can quote the same number the
+        # request actually used. 深度思考 doubles it, which is why one document sometimes
+        # fits and the same one sometimes does not.
+        gen_limit = settings.thinking_max_tokens if thinking else settings.max_tokens
         for _ in range(settings.max_tool_rounds + 1):
             buffers = _ToolCallBuffer()
             text_parts: list[str] = []
@@ -160,7 +164,7 @@ async def stream_chat(
                 "stream_options": {"include_usage": True},
                 "temperature": settings.temperature,
                 "top_p": settings.top_p,
-                "max_tokens": settings.thinking_max_tokens if thinking else settings.max_tokens,
+                "max_tokens": gen_limit,
                 "chat_template_kwargs": {"enable_thinking": thinking},
             }
             if tools:
@@ -208,6 +212,12 @@ async def stream_chat(
 
             tool_calls = buffers.calls()
             if finish_reason != "tool_calls" or not tool_calls:
+                # Asked before the break, not after: this is the exit that used to end the
+                # stream in silence when generation hit max_tokens part way through a tool
+                # call's arguments.
+                note = _truncation_note(finish_reason, len(tool_calls), bool(text_parts), gen_limit)
+                if note:
+                    yield {"type": note[0], "text": note[1]}
                 break
 
             payload_messages.append(
@@ -232,8 +242,26 @@ async def stream_chat(
             for n, call in enumerate(tool_calls):
                 name = _effective_name(call["name"], search_on)
                 args = _parse_args(call["arguments"])
+                bad_args = args is None
+                if bad_args and search_on and name in _SEARCH_TOOLS:
+                    # Search keeps the degradation it has always had: {} here means the
+                    # query falls through to _fallback_query, so a truncated search still
+                    # searches using the user's own words instead of failing. Clearing the
+                    # flag lets it drop into the unchanged branches below.
+                    args = {}
+                    bad_args = False
 
-                if search_on and name == "fetch_url":
+                if bad_args:
+                    # Not dispatched: half a document must not be half-written. It still
+                    # has to answer as this call's tool result, because the assistant turn
+                    # appended above carries a tool_calls entry, and llama-server rejects
+                    # a round where one of those has no matching tool response.
+                    content = (
+                        "工具参数不是合法 JSON，多半是回复达到生成长度上限、参数在中途被截断，"
+                        "本次调用没有执行。同样的上限每轮都一样，原样重试还会被截断："
+                        "请把内容明显缩短，或分成几次请求。"
+                    )
+                elif search_on and name == "fetch_url":
                     url = str(args.get("url") or "").strip()
                     yield {"type": "status", "text": f"正在读取网页：{url[:90]}"}
                     content = await fetch_url(url)
@@ -321,12 +349,59 @@ async def stream_chat(
     }
 
 
-def _parse_args(raw_arguments: str) -> dict:
-    try:
-        parsed = json.loads(raw_arguments or "{}")
-    except json.JSONDecodeError:
+def _parse_args(raw_arguments: str) -> dict | None:
+    """The arguments of one streamed tool call.
+
+    None means the text is not valid JSON, which in practice means generation hit
+    max_tokens part way through the argument — the failure save_document makes common,
+    since a whole document arrives as one escaped string. {} means the model genuinely
+    sent no arguments. Both used to return {}, so a half-written document was
+    indistinguishable from an empty call and nothing anywhere said so.
+    """
+    if not (raw_arguments or "").strip():
         return {}
+    try:
+        parsed = json.loads(raw_arguments)
+    except json.JSONDecodeError:
+        return None
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _truncation_note(
+    finish_reason: str | None, n_calls: int, has_text: bool, limit: int
+) -> tuple[str, str] | None:
+    """What to say when generation hit max_tokens, or None to behave exactly as before.
+
+    `length` with buffered tool calls and no text used to produce a completely blank
+    reply: stream_chat's break dropped the half-built call, no delta had been emitted
+    either, and the browser rendered an empty bubble. That is the 「罢工」 symptom the
+    empty-turn replay caused, reached by a different road.
+
+    It answers ("error", …) rather than ("status", …) in that case on purpose. An error
+    marks the turn msg.error, and isSendable keeps an errored turn off the next
+    request's wire — so the blank turn is not replayed to the model afterwards.
+
+    Erroring out is right rather than letting the model retry, and the reason is
+    arithmetic: max_tokens is the same on every round of the same request, so an argument
+    that did not fit once provably does not fit again. Burning the remaining rounds on
+    retries that cannot succeed ends in 「已达到最大工具轮次」, which tells the user less
+    than naming the limit does.
+
+    A separate function so the decision can be tested without faking a streaming HTTP
+    response.
+    """
+    if finish_reason != "length":
+        return None
+    if has_text:
+        return ("status", f"回复已达到生成长度上限（{limit} token），内容可能不完整。")
+    if n_calls:
+        return (
+            "error",
+            f"回复达到生成长度上限（{limit} token），工具调用的参数在中途被截断，"
+            "这一轮既没有可用的调用也没有正文。同样的上限每轮都一样，重试也会被截断："
+            "请把要求拆小，或让文档明显更短。",
+        )
+    return ("error", f"回复达到生成长度上限（{limit} token），而且没有产生任何内容。请重试。")
 
 
 def _effective_name(raw_name: str, search_on: bool) -> str:

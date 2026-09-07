@@ -46,7 +46,13 @@ from .settings_store import (
     read_overrides,
 )
 from .sysstats import SystemStats
-from .tools import ToolRunner, build_tools, effective_prompt, fs_tool_names
+from .tools import (
+    MAX_ARTIFACT_CHARS,
+    ToolRunner,
+    build_tools,
+    effective_prompt,
+    fs_tool_names,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 log = logging.getLogger("app")
@@ -171,6 +177,10 @@ class ChatRequest(BaseModel):
     # otherwise be able to switch on something the user never ticked.
     use_memory: bool = False
     use_think: bool = False
+    # Same shape as use_think rather than as use_memory: it has no .env kill switch,
+    # because nothing lands on the server. The document goes straight to the browser's
+    # download directory, so model capability is the only thing there is to gate on.
+    doc_gen: bool = False
     fs_read: bool = False
     fs_write: bool = False
 
@@ -197,6 +207,29 @@ class StoredSource(BaseModel):
         return value
 
 
+class StoredArtifact(BaseModel):
+    """One document a model generated with save_document.
+
+    Archived so the chip survives a reload — and, because `content` is Markdown for all
+    five formats rather than the bytes of the file that was asked for, so it can be
+    re-downloaded afterwards in a different format.
+
+    This model is the only gate on the archive path: history.py stores messages verbatim
+    and validates nothing per field, which is the same position reasoning, sources and
+    had_images already occupy.
+    """
+
+    filename: str = Field(default="", max_length=120)
+    # A Literal so a hand-edited archive is Pydantic's 422 rather than a format the
+    # browser's dispatch has no branch for. Same reasoning as ExportIn.format. The five
+    # values duplicate tools.ARTIFACT_FORMATS because a Literal cannot be built from a
+    # tuple; tests/test_artifacts.py pins the two against each other so the copy cannot
+    # drift silently.
+    format: Literal["md", "html", "csv", "pdf", "docx"] = "md"
+    title: str = Field(default="", max_length=120)
+    content: str = Field(default="", max_length=MAX_ARTIFACT_CHARS)
+
+
 class StoredMessage(MessageIn):
     """An archived message: what goes to the model, plus what the UI reads back."""
 
@@ -208,6 +241,10 @@ class StoredMessage(MessageIn):
     # localStorage has the flag but not the pixels, and deriving it would erase the
     # "images not saved" note the first time that session is re-saved.
     had_images: bool = False
+    # Worst case 8 x MAX_ARTIFACT_CHARS = 320 KB in one message, realistic ~3 KB per
+    # document. That is three orders of magnitude below the base64 images which are why
+    # history.py splits index.json from the session bodies, so it needs no change there.
+    artifacts: list[StoredArtifact] = Field(default_factory=list, max_length=8)
 
 
 class SessionCreate(BaseModel):
@@ -667,6 +704,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
     mcp_ok, mcp_why = mcp_host.available()
     use_memory = req.use_memory and s.memory_enabled and runtime.supports_tools
     use_think = req.use_think and runtime.supports_tools
+    use_doc_gen = req.doc_gen and runtime.supports_tools
     use_fs_read = req.fs_read and mcp_ok and runtime.supports_tools
     # Writing is an addition to reading, not a capability of its own. The checkbox is
     # disabled in the UI unless reading is ticked, and clamped the same way here.
@@ -678,6 +716,8 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         )
     if req.use_think and not use_think:
         log.warning("ignoring use_think: %s does not support tool calls", model)
+    if req.doc_gen and not use_doc_gen:
+        log.warning("ignoring doc_gen: %s does not support tool calls", model)
     if req.fs_read and not use_fs_read:
         log.warning("ignoring fs_read: %s", mcp_why or f"{model} does not support tool calls")
     if req.fs_write and not use_fs_write:
@@ -702,6 +742,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         search=use_search,
         memory=use_memory,
         think=use_think,
+        doc_gen=use_doc_gen,
         fs_read=use_fs_read,
         fs_write=use_fs_write,
         fs_raw=fs_raw,
@@ -726,6 +767,7 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             for key, on in (
                 ("memory", use_memory),
                 ("think", use_think),
+                ("doc_gen", use_doc_gen),
                 ("fs_read", use_fs_read),
                 ("fs_write", use_fs_write),
             )
