@@ -58,7 +58,7 @@ EDITABLE = frozenset(SettingsPatch.model_fields)
 
 SECRET_FIELDS = frozenset({"bocha_api_key", "tavily_api_key"})
 
-# Why the other 20 are read-only. Shown verbatim under the greyed-out value.
+# Why the other 21 are read-only. Shown verbatim under the greyed-out value.
 _SERVER_REASON = "需改 .env 并重启 llama-server"
 _APP_REASON = "需改 .env 并重启应用"
 REASONS = {
@@ -84,6 +84,10 @@ REASONS = {
     "mcp_node_path": _APP_REASON + "；留空 = 自动发现",
     "mcp_startup_timeout": _APP_REASON,
     "memory_enabled": _APP_REASON,
+    # Read once too, when setup_logging builds the handlers -- the same reason it
+    # stays out of EDITABLE, and without an entry here describe() would render the
+    # greyed-out value with nothing under it to say why.
+    "log_level": _APP_REASON,
     # switch_model() moves the runtime, not Settings: what is shown here is the
     # boot default, and pointing the user at the dropdown is more useful than
     # telling them to restart.

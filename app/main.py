@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
+from collections import Counter
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Literal
@@ -15,7 +17,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import MutableHeaders
 
 from . import history
-from .config import ROOT, Settings, get_settings
+from .config import ROOT, Settings, get_settings, setup_logging
 from .documents import (
     DOC_MAX_CHARS,
     MAX_DOC_BYTES,
@@ -54,7 +56,6 @@ from .tools import (
     fs_tool_names,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(name)s: %(message)s")
 log = logging.getLogger("app")
 
 DATA_URL_RE = re.compile(r"^data:image/(?:png|jpeg|jpg|webp|gif);base64,[A-Za-z0-9+/=\s]+$")
@@ -83,6 +84,9 @@ stats = SystemStats()
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global runtime, mcp_host
     settings = get_settings()
+    # First, because everything below logs. run.py already called this for the shipped
+    # entry point; the call is idempotent and this one covers `uvicorn app.main:app`.
+    setup_logging(settings)
     runtime = LlamaRuntime(settings)
     # Constructing this cannot fail: no Node.js, no installed server and no allowed
     # root is discovered here, and each turns into "the file capability is unavailable"
@@ -670,6 +674,10 @@ async def chat(req: ChatRequest) -> StreamingResponse:
             if runtime.state == "switching"
             else f"模型未就绪: {runtime.detail}"
         )
+        # This path returns before events() is constructed, so without this line a chat
+        # that produced nothing at all would be the one request app.log never mentions.
+        # Truncated because runtime.detail can carry a llama-server log tail.
+        log.warning("chat refused: runtime state=%s: %s", runtime.state, reason[:200])
         return StreamingResponse(
             iter([sse("error", {"text": reason})]),
             media_type="text/event-stream",
@@ -760,25 +768,28 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         fs_tools=(fs_all if use_fs_write else fs_readable) if use_fs_read else set(),
         fs_write_tools=(fs_all - fs_readable) if use_fs_write else set(),
     )
+    # Named rather than inlined in the call below because the per-request log line
+    # reports it: which prompt lines were paid for is half of diagnosing a turn.
+    feature_keys = {
+        key
+        for key, on in (
+            ("memory", use_memory),
+            ("think", use_think),
+            ("doc_gen", use_doc_gen),
+            # The inverse of the line above rather than a seventh feature: both answer
+            # "the user wants a file" and giving the model both is what made it ignore
+            # save_document entirely. use_doc_gen is already clamped on supports_tools,
+            # so a model that cannot call tools at all gets this one — which is right,
+            # since clicking 导出 is then the only path to a file that exists.
+            ("export_hint", not use_doc_gen),
+            ("fs_read", use_fs_read),
+            ("fs_write", use_fs_write),
+        )
+        if on
+    }
     prompt = effective_prompt(
         s.system_prompt,
-        {
-            key
-            for key, on in (
-                ("memory", use_memory),
-                ("think", use_think),
-                ("doc_gen", use_doc_gen),
-                # The inverse of the line above rather than a seventh feature: both answer
-                # "the user wants a file" and giving the model both is what made it ignore
-                # save_document entirely. use_doc_gen is already clamped on supports_tools,
-                # so a model that cannot call tools at all gets this one — which is right,
-                # since clicking 导出 is then the only path to a file that exists.
-                ("export_hint", not use_doc_gen),
-                ("fs_read", use_fs_read),
-                ("fs_write", use_fs_write),
-            )
-            if on
-        },
+        feature_keys,
         # The same list the MCP child was started with, so what the prompt promises
         # and what the sandbox enforces cannot drift apart. Only read when fs_read is
         # on — that is the only line with a placeholder in it.
@@ -812,24 +823,74 @@ async def chat(req: ChatRequest) -> StreamingResponse:
         fitted, notes = [], ["上一轮回复为空，本轮没有可发送的内容，请重新提问。"]
 
     async def events() -> AsyncIterator[str]:
-        # One joined line rather than an event per note: the UI keeps a single
-        # status slot, so separate events would overwrite each other and only the
-        # last would ever be read. Gated on `fitted` because the notes describe
-        # trimming that happened; when nothing will be sent at all, the error event
-        # below carries the same text and emitting both shows it to the user twice.
-        if fitted and (mcp_note or notes):
-            yield sse("status", {"text": " ".join(x for x in (mcp_note, *notes) if x)})
-        if not fitted:
-            # Either even the last message will not fit, or every turn was filtered
-            # out as empty. notes[0] is the reason computed for exactly that case.
-            yield sse("error", {"text": notes[0] if notes else "上下文长度不足，请新建对话。"})
-            return
+        started = time.monotonic()
+        counts: Counter[str] = Counter()
+        usage: dict = {}
+        # try/finally around the whole body, including the two yields below the loop,
+        # so every request is accounted for: the not-fitted return, an exception, and a
+        # client disconnect -- which arrives as GeneratorExit thrown into whichever
+        # yield was suspended -- all reach the finally. That last one is the 停止 button
+        # and the closed tab, and it is exactly the case that used to leave no trace.
         try:
-            async for event in stream_chat(s, fitted, tools, runner, req.thinking):
-                yield sse(event["type"], event)
-        except Exception as exc:  # noqa: BLE001 - surface any failure to the browser
-            log.exception("chat failed")
-            yield sse("error", {"text": f"{type(exc).__name__}: {exc}"})
+            # One joined line rather than an event per note: the UI keeps a single
+            # status slot, so separate events would overwrite each other and only the
+            # last would ever be read. Gated on `fitted` because the notes describe
+            # trimming that happened; when nothing will be sent at all, the error event
+            # below carries the same text and emitting both shows it to the user twice.
+            if fitted and (mcp_note or notes):
+                counts["status"] += 1
+                yield sse("status", {"text": " ".join(x for x in (mcp_note, *notes) if x)})
+            if not fitted:
+                # Either even the last message will not fit, or every turn was filtered
+                # out as empty. notes[0] is the reason computed for exactly that case.
+                counts["error"] += 1
+                yield sse("error", {"text": notes[0] if notes else "上下文长度不足，请新建对话。"})
+            else:
+                try:
+                    async for event in stream_chat(s, fitted, tools, runner, req.thinking):
+                        counts[event["type"]] += 1
+                        if event["type"] == "done":
+                            usage = event.get("usage") or {}
+                        yield sse(event["type"], event)
+                except Exception as exc:  # noqa: BLE001 - surface any failure to the browser
+                    log.exception("chat failed")
+                    counts["error"] += 1
+                    yield sse("error", {"text": f"{type(exc).__name__}: {exc}"})
+        finally:
+            # Counts and timings only. Not the user's message, not the answer, not the
+            # source URLs: the archive already keeps the text, and a log that repeats it
+            # is a second copy of everything anyone typed into this app sitting in a
+            # file nobody reviews. A live search API key was printed into a test log
+            # here once, so the rule this line follows is that it reports only what it
+            # counted, never a value it was handed.
+            #
+            # completion_tok is the LAST round's, not the request's: stream_chat keeps
+            # one usage dict and each llama-server call overwrites it. A turn that
+            # generated a 2,745-character document and then one word of prose logs
+            # completion_tok=1, which is how that measurement was misread once already.
+            # tool_results says how many rounds are missing from it, and the per-round
+            # generation counts are in runtime/llama-server.log -- until the next
+            # restart truncates it, which is the reason this line exists.
+            log.info(
+                "chat %s %.1fs sent=%d/%d ctx=%d tools=%d features=%s "
+                "prompt_tok=%s completion_tok=%s deltas=%d reasoning=%d "
+                "tool_results=%d artifacts=%d notes=%d errors=%d",
+                model,
+                time.monotonic() - started,
+                len(fitted),
+                len(history),
+                n_ctx,
+                len(tools),
+                ",".join(sorted(feature_keys)) or "-",
+                usage.get("prompt_tokens"),
+                usage.get("completion_tokens"),
+                counts["delta"],
+                counts["reasoning"],
+                counts["tool_result"],
+                counts["artifact"],
+                counts["status"],
+                counts["error"],
+            )
 
     return StreamingResponse(
         events(),

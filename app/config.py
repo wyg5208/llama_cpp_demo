@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from functools import lru_cache
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from pydantic import Field, field_validator
@@ -13,6 +14,23 @@ from .settings_store import read_overrides
 log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
+
+# --- logging -------------------------------------------------------------------
+# A closed set rather than logging.getLevelName(), which answers an unknown name with
+# the string "Level 7" -- a typo would then configure a level nobody asked for and say
+# nothing about it.
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+LOG_FORMAT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
+# 1 MB active plus 3 backups. Sized against what this app writes: one line per chat
+# request, so the cap holds tens of thousands of turns. What would blow straight
+# through it is uvicorn's access log -- see setup_logging for why that stays on the
+# console only.
+APP_LOG_MAX_BYTES = 1_000_000
+APP_LOG_BACKUPS = 3
+# Marks the handlers setup_logging owns, so calling it twice replaces them instead of
+# stacking a second copy of every line.
+_HANDLER_TAG = "llama_cpp_demo_handler"
+
 
 DEFAULT_SYSTEM_PROMPT = (
     "你是一个乐于助人的中文 AI 助手。回答准确、简洁、有条理，必要时使用 Markdown 排版。\n"
@@ -110,6 +128,12 @@ class Settings(BaseSettings):
     # 8000 is commonly taken by ComfyUI on this machine.
     port: int = 8123
 
+    # --- logging -----------------------------------------------------------
+    # Console plus runtime/app.log. Kept out of settings_store.EDITABLE on purpose:
+    # the handlers are built once at startup, so a level changed from the settings
+    # panel would look saved and do nothing until the next restart.
+    log_level: str = "INFO"
+
     @field_validator("runtime_backend")
     @classmethod
     def _check_backend(cls, value: str) -> str:
@@ -144,6 +168,17 @@ class Settings(BaseSettings):
                 raise ValueError(f"MCP_FS_ROOTS 里的目录不存在: {item!r}")
         return value
 
+    @field_validator("log_level")
+    @classmethod
+    def _check_log_level(cls, value: str) -> str:
+        # Normalised here so setup_logging can use the value directly, and rejected
+        # rather than defaulted: a LOG_LEVEL typo that quietly left the app at INFO
+        # would look like "DEBUG produced nothing" instead of like a misspelling.
+        upper = value.strip().upper()
+        if upper not in LOG_LEVELS:
+            raise ValueError(f"LOG_LEVEL 应为 {list(LOG_LEVELS)} 之一，收到: {value!r}")
+        return upper
+
     @property
     def uses_external_server(self) -> bool:
         return self.runtime_backend == "external" or bool(self.llama_server_url)
@@ -164,7 +199,20 @@ class Settings(BaseSettings):
 
     @property
     def server_log(self) -> Path:
+        """llama-server's own stdout and stderr, redirected by runtime.py.
+
+        Opened with "w", so it holds the current run only: a restart destroys the
+        previous one. That is deliberate -- _tail_log() quotes it back in a 502 when
+        the server refuses new weights, where stale lines would mislead -- but it does
+        mean generation counts from an earlier run are gone. runtime/app.log is the
+        durable one.
+        """
         return ROOT / "runtime" / "llama-server.log"
+
+    @property
+    def app_log(self) -> Path:
+        """This application's log. Rotating, UTF-8, and it survives restarts."""
+        return ROOT / "runtime" / "app.log"
 
     @property
     def model_dir(self) -> Path:
@@ -260,3 +308,90 @@ def get_settings() -> Settings:
         # subordinate to .env, so .env cannot be the thing that repairs it.
         log.warning("ignoring settings override that failed to apply: %s", exc)
         return base
+
+
+def setup_logging(settings: Settings) -> None:
+    """Console always; runtime/app.log whenever it can be opened. Safe to call twice.
+
+    LOG_LEVEL governs this package's own loggers and uvicorn's, not third-party
+    libraries' — the body below says why that distinction is the whole design.
+
+    Called from run.py before uvicorn starts and again from app.main's lifespan, so the
+    shipped entry point and a bare `uvicorn app.main:app` both get the file. The second
+    call replaces the first one's handlers instead of adding to them: two copies of
+    every line is the failure mode the tag exists to prevent, and it is invisible in a
+    console scrollback but obvious in a file.
+    """
+    # getLevelName is bidirectional, and log_level came through _check_log_level, so
+    # this is one of the five integers and never the "Level X" it returns for a name it
+    # does not know.
+    level = logging.getLevelName(settings.log_level)
+    root = logging.getLogger()
+    # A floor of WARNING on root rather than LOG_LEVEL. Root's level is the effective
+    # level of every third-party logger that does not set its own, so LOG_LEVEL=DEBUG on
+    # root turns on httpcore's per-socket-frame tracing too: measured on a real start,
+    # six HTTP requests wrote ~80 httpcore lines into app.log, and this app streams every
+    # token from llama-server through httpx, so a single chat turn at DEBUG would rotate
+    # away everything worth keeping. max() keeps it monotone — asking for ERROR or
+    # CRITICAL still narrows root, only DEBUG and INFO stop at the floor.
+    #
+    # Root's level does not filter records that propagate INTO it; only handler levels
+    # do. So the "app" and uvicorn loggers set below still reach these handlers at
+    # whatever LOG_LEVEL asked for.
+    root.setLevel(max(level, logging.WARNING))
+    # All fifteen modules in this package log to "app" or "app.<module>", so this one
+    # logger's level covers every line the app itself writes.
+    logging.getLogger("app").setLevel(level)
+
+    for handler in [h for h in root.handlers if getattr(h, _HANDLER_TAG, False)]:
+        root.removeHandler(handler)
+        handler.close()
+
+    formatter = logging.Formatter(LOG_FORMAT)
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    setattr(console, _HANDLER_TAG, True)
+    root.addHandler(console)
+
+    try:
+        settings.app_log.parent.mkdir(parents=True, exist_ok=True)
+        file_handler: logging.Handler = RotatingFileHandler(
+            settings.app_log,
+            maxBytes=APP_LOG_MAX_BYTES,
+            backupCount=APP_LOG_BACKUPS,
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        # A read-only runtime/ or a full disk must not stop the app. The console
+        # handler is already attached, so nothing is lost but the file, and saying so
+        # once here beats a "--- Logging error ---" traceback on every later record.
+        # Rollover itself can still fail on Windows if a second process holds app.log
+        # open -- renaming an open file is refused there -- but the launcher kills old
+        # instances before starting a new one, and the failure is noisy, not fatal.
+        log.warning("日志文件 %s 打不开，本次只输出到控制台: %s", settings.app_log, exc)
+        return
+    file_handler.setFormatter(formatter)
+    setattr(file_handler, _HANDLER_TAG, True)
+    root.addHandler(file_handler)
+
+    # uvicorn 0.52 runs configure_logging() in Config.__init__, which is before it
+    # imports this app, and gives "uvicorn" its own handler with propagate=False. Its
+    # records would therefore never reach the root logger and never reach the file.
+    # Rerouted rather than handed the file handler directly: a shared handler on a
+    # logger that still propagates writes every line twice.
+    #
+    # "uvicorn.access" is deliberately left alone. The browser polls /api/stats every
+    # 2 s (static/app.js, STATS_MS=2000), so an access log in the file is ~43,000
+    # lines a day at ~100 bytes each -- about 4 MB, which is the whole rotation budget
+    # spent daily on telemetry nobody reads back. Startup and error lines from
+    # "uvicorn" and "uvicorn.error" are rare and worth keeping.
+    for name in ("uvicorn", "uvicorn.error"):
+        named = logging.getLogger(name)
+        for handler in list(named.handlers):
+            named.removeHandler(handler)
+        named.propagate = True
+        # Their own level, not just the root's: uvicorn sets both to INFO, which would
+        # filter a DEBUG record out before the handler LOG_LEVEL=DEBUG just installed
+        # ever saw it — and the WARNING floor on root above would filter it out too if
+        # these inherited rather than carried a level of their own.
+        named.setLevel(level)
