@@ -1,8 +1,9 @@
 """Runtime-mutable settings: what the browser may change, and where it is kept.
 
-The app has 23 settings and only 8 of them are safe to change while it runs — the
+The full set of settings lives in config.py's Settings; the eight enumerated by
+SettingsPatch below are the only ones safe to change while it runs — the
 ones read per request when building the generation payload. This module is the
-single source of truth for that split: SettingsPatch below is both the request
+single source of truth for that split: SettingsPatch is both the request
 body type and the allowlist for the on-disk file, so the two cannot drift.
 
 Overrides live in runtime/settings_override.json and win over .env. They are
