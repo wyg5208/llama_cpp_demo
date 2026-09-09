@@ -956,7 +956,7 @@ class TestFilenameSanitisation(unittest.TestCase):
         shapes = [
             "> **【角色设定】**：你是一位深谙家庭心理学，擅长用温和而坚定的方式帮助家庭成员",
             "对比 MD, DOCX, PDF, HTML, CSV 的差异",
-            'C:\\Users\\Leo\\报告.txt',
+            'C:\\Users\\user\\报告.txt',
             "  前后有空格与点...  ",
             "...",
             "",
