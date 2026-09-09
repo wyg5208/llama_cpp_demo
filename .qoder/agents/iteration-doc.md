@@ -14,12 +14,12 @@ tools: Read, Write, SearchReplace, Grep, Glob, Bash
 
 | 实际现状 | 对流程的影响 |
 |---|---|
-| `README.md` 自 v1.0.0 起存在，是**版本号唯一来源**（顶部 `**版本 / Version**` 行 + 第 9 节版本历史） | 读版本号一律用 `Grep` 匹配 `**版本 / Version**`，**不要按行号取**（正文会变长）；不改动与本次迭代无关的 README 章节 |
-| `git tag` 当前为空，且无远程仓库 | 发布提交上的本地 tag 由 `version-release` 负责，本 agent 不打 tag、不碰远程 |
-| `docs/开发记录/` 已建好，`index.md` 已有表头与 v1.0.0 一条 | 直接写记录文件并在 index 顶部追加条目；不重建目录、不改写已有表头与历史条目 |
-| `.gitignore` 只有 13 行：`.env`、`.venv/`、`__pycache__/`、`*.pyc`、`runtime/` | `runtime/` 下的会话归档、日志、模型二进制、`mcp/node_modules/` 一律不入库，也不得出现在交付物清单里 |
+| `README.md` 自 v1.0.0 起存在，是**版本号唯一来源**（顶部 `**版本 / Version**` 行 + 第 9 节版本历史）；自 v1.1.0 起该行的**机器读取入口是 `app/version.py:read_version()`**（结果经 `/api/about` 的 `version` 字段显示到关于面板），格式由 `tests/test_version.py` 锁定 | 读版本号一律用 `read_version()`（它就是界面显示的那个值），自检命令见第 1.1 节；不要按行号取（正文会变长）；Grep 匹配 `**版本 / Version**` 只作交叉对账；不改动与本次迭代无关的 README 章节 |
+| 本仓库无远程仓库；本地 tag 只出现在发布提交上 | 本 agent 不打 tag、不碰远程，tag 由 `version-release` 负责 |
+| `docs/开发记录/` 已建好，`index.md` 已有表头与历史条目（条目数不写死） | 直接写记录文件并在 index 顶部追加条目；不重建目录、不改写已有表头与历史条目 |
+| `.gitignore` 忽略 `.env`、`.venv/`、`__pycache__/`、`*.pyc`、`runtime/` | `runtime/` 下的会话归档、日志、模型二进制、`mcp/node_modules/` 一律不入库，也不得出现在交付物清单里；引用该文件时写它忽略的路径，不写行数 |
 | 测试是标准库 `unittest`（项目明确拒绝引入 pytest） | 验证命令一律用 `python -m unittest` |
-| 配置项的唯一权威说明在 `.env.example`（约 40 KB 中文注释）；`.env` 含检索后端密钥且不入库 | **禁止读取 `.env`**；任何 Settings 字段增删改都要同步 `.env.example` |
+| 配置项的唯一权威说明在 `.env.example`（中文注释为主）；`.env` 含检索后端密钥且不入库 | **禁止读取 `.env`**；任何 Settings 字段增删改都要同步 `.env.example` |
 | PowerShell 5.1 | 命令分隔用 `;`，不要用 `&&` |
 
 ## 1. 信息收集
@@ -28,7 +28,11 @@ tools: Read, Write, SearchReplace, Grep, Glob, Bash
 ```powershell
 git status --short; git diff --stat; git log --oneline -n 10
 ```
-结合对话上下文确认迭代目标与关键决策。当前版本号用 `Grep` 在 `README.md` 中匹配 `**版本 / Version**: v` 取得。
+结合对话上下文确认迭代目标与关键决策。当前版本号用 `read_version()` 取（它返回不带 `v` 的裸数字，也是关于面板显示的值）：
+```powershell
+$env:PYTHONIOENCODING="utf-8"; .venv/Scripts/python.exe -c "from app.version import read_version; print(read_version())"
+```
+返回 `None` 说明 README 版本行已被改坏（或 `README.md` 不在仓库根）：先停下核实，不要直接接着写新版本号。
 
 **1.2 涉及的真实模块**（写"涉及模块"章节时用左列路径，不要臆造）
 
@@ -48,12 +52,13 @@ git status --short; git diff --stat; git log --oneline -n 10
 | `app/history.py` | 会话归档：`runtime/history/index.json` + 每个会话一个 JSON 文件（两级） |
 | `app/memory_store.py` | 长期记忆：`runtime/memory.json`，仅经 remember/recall 工具读写 |
 | `app/sysstats.py` | 顶栏遥测：ctypes 直调 Win32 与 NVML，无 psutil/pynvml |
+| `app/version.py` | `read_version()`：从 `README.md` 顶部版本行正则取应用版本号，按 `(路径, mtime_ns, size)` 缓存，取不到返回 None（不抛异常） |
 | `app/main.py` | 全部 `/api/*` 路由、SSE 流式对话、`/api/settings`、`/api/about`、`/api/export`、`/api/documents` |
 | `static/index.html` `static/app.js` `static/style.css` | 无构建步骤的原生前端；`/static` 由 `StaticFiles` 挂载并带 `Cache-Control: no-cache`，改完刷新即生效 |
 | `scripts/launcher.ps1` | 启动前的环境校验、结束旧实例、等端口释放、打开浏览器 |
 | `scripts/fetch_runtime.py` / `scripts/fetch_mcp.py` | 拉取 llama.cpp 预编译包（可续传 + sha256）/ npm 安装 filesystem MCP |
-| `tests/test_*.py` | 8 个 unittest 文件，全部以标准库断言为主 |
-| `README.md` | 项目总览与**版本号唯一来源**：顶部版本行、第 5 节接口表、第 7 节约定、第 8 节版本规则、第 9 节版本历史 |
+| `tests/test_*.py` | 标准库 unittest 文件集（数量以 `git ls-files tests` 为准，不在文档里写死），其中 `test_version.py` 锁定版本号契约 |
+| `README.md` | 项目总览与**版本号唯一来源**：顶部版本行（由 `app/version.py` 读取）、第 5 节接口表、第 7 节约定、第 8 节版本规则、第 9 节版本历史 |
 | `docs/开发记录/index.md` | 迭代记录索引（最新在上，条目格式见第 4 节） |
 
 ## 2. 改动规模评估与版本号
@@ -106,17 +111,27 @@ docs/开发记录/v{新版本号}_{YYYY-MM-DD}_{功能描述}.md
 
 版本号只落在上表四处；打 tag 交给 `version-release`。
 
+**四处写完必须重跑 `tests/test_version.py`**：自 v1.1.0 起，上表四个落点之间的一致性不再是约定而是断言（README 版本行 == 第 9 节首条 `### vX.Y.Z` == `index.md` 记录列表首条 `- vX.Y.Z ` == 最新记录文件名的版本）。漏同步任何一处都会测试失败；反过来，改了 README 版本行的**写法**（而不只是数字）而不同步 `app/version.py:VERSION_RE`，会让关于面板静默显示「未知」。
+
 ## 5. 验证命令（文档中引用的结论必须来自这里）
 
 ```powershell
-# 全量单元测试（455 个用例，含 2 个 skip；热跑约 21 秒、冷启动约 34 秒）
+# 全量单元测试（用例数随迭代增长，不写死：以命令末行 `Ran N tests` 为准；约 20~60 秒，视磁盘缓存）
 $env:PYTHONIOENCODING="utf-8"; .venv/Scripts/python.exe -m unittest discover -s tests -v
+
+# 本仓规则下每次迭代收尾必跑（四处版本号一致性 + 版本行格式契约）
+$env:PYTHONIOENCODING="utf-8"; .venv/Scripts/python.exe -m unittest tests.test_version -v
 
 # 单个文件
 $env:PYTHONIOENCODING="utf-8"; .venv/Scripts/python.exe -m unittest tests.test_export -v
 
 # 启动（launcher.ps1 负责环境检查与清理旧实例，随后 run.py 起 uvicorn）
 .\start_app.bat
+```
+
+PowerShell 5.1 会把 unittest 写到 stderr 的**正常进度**当成错误（`NativeCommandError`，红字，退出码可能变 1 而测试其实 `OK`）。要可靠判定成败，请全量重定向到 `runtime/` 后取尾行，并单独读退出码（不入库）：
+```powershell
+$env:PYTHONIOENCODING="utf-8"; & .\.venv\Scripts\python.exe -m unittest discover -s tests *> runtime\testrun.log; "exit=$LASTEXITCODE"; Get-Content runtime\testrun.log -Tail 3
 ```
 启动后浏览器访问 `http://127.0.0.1:8123`（`host=127.0.0.1`、`port=8123`；配置里注明 8000 常被本机 ComfyUI 占用，不要改回去）。排障看 `runtime/app.log`（滚动 1 MB × 3）与 `runtime/llama-server.log`；`GET /api/status`、`GET /api/about` 可确认子进程与模型是否就绪。
 
@@ -132,6 +147,7 @@ $env:PYTHONIOENCODING="utf-8"; .venv/Scripts/python.exe -c "from app.config impo
 | 新增/改名/删除任一 Settings 字段 | `app/config.py`（字段 + 校验器）→ **`.env.example` 对应小节加中文说明** → 若该字段需运行时可改，再加入 `app/settings_store.py` 的 `SettingsPatch`（该文件是请求体与落盘白名单，二者不能漂移） |
 | 新字段需要在界面上改 | `static/index.html` 表单 + `static/app.js` 读写 `/api/settings`；`/api/about` 面板信息同步 |
 | 新增 `/api` 端点 | `app/main.py` + `static/app.js` 调用处 + 对应 `tests/test_*.py` |
+| 改动 `README.md` 顶部版本行的**写法**或 `app/version.py` | 二者必须同改（`VERSION_RE` ↔ 那一行），并同步 `tests/test_version.py` 里独立重写的模式常量与 `static/app.js` 关于面板行；否则界面静默显示「未知」 |
 | 新增运行时依赖 | `requirements.txt`：**文件必须保持纯 ASCII**（pip 按本地 cp936 解码，中文注释会让安装直接失败）；会拉入大体积传递依赖的包要精确锁版本（参见 `pymupdf4llm==1.28.2` 的注释）；同步记入迭代文档「技术栈」 |
 | 新增落盘数据 | 路径一律挂在 `runtime/` 下（已被忽略），并在迭代文档说明清理/迁移方式 |
 | 改启动逻辑 | `scripts/launcher.ps1`（UTF-8 **带 BOM**，PowerShell 5.1 靠 BOM 判编码）；`start_app.bat` **只能纯 ASCII**，中文注释会被 cmd 按字节偏移错读后当命令执行 |
@@ -149,7 +165,8 @@ $env:PYTHONIOENCODING="utf-8"; .venv/Scripts/python.exe -c "from app.config impo
 - 基线提交：<短哈希>  工作区状态：clean / 有未提交更改（列出）
 - 涉及模块：xxx
 - 联动核对：.env.example ☐ / settings_store ☐ / static ☐ / requirements.txt ☐ / README 事实 ☐
-- 验证：unittest 455 通过（含 2 个 skip），耗时 xx s
+- 验证：unittest {N} 个用例通过（含 {M} 个 skip），耗时 xx s  ← 取命令末行真实数字，不引用历史值
+- 版本号一致性：tests/test_version.py {通过 / 新增 skip 已消除}
 - 修改文件：x 个，新增文件：x 个
 ```
 
@@ -160,6 +177,7 @@ $env:PYTHONIOENCODING="utf-8"; .venv/Scripts/python.exe -c "from app.config impo
 - 文档只落在 `docs/开发记录/`，命名遵循 `v{版本号}_{日期}_{功能描述}.md`
 - 所有路径、端口、字段名、命令以仓库现状为准：写引用前先 `Read`/`Grep` 核对，禁止凭印象编造
 - 「测试验证」章节的结论必须来自真实命令输出
+- 四处同步写完后重跑 `tests/test_version.py`，把前/后差异（尤其是那个“尚无迭代记录”的 skip 转为通过）写进「测试验证」
 - 临时脚本、调试输出等一律写在 `runtime/` 下，保证不被提交
 
 **禁止执行：**
@@ -168,6 +186,7 @@ $env:PYTHONIOENCODING="utf-8"; .venv/Scripts/python.exe -c "from app.config impo
 - 禁止顺手重写 `README.md` 中与本次迭代无关的章节（只动版本行、版本历史，以及确实因本次迭代失真的事实）
 - 禁止删除或改写既有迭代记录（历史只追加）
 - 禁止凭手感升主版本号，禁止在文档中写"已验证"而没有对应命令输出
+- 禁止把应用版本号做成 `Settings` 字段或写回 `settings_store.SettingsPatch`：版本号不可由用户配置，也不属于“运行时可改”承诺面（v1.1.0 决策，详见 `app/version.py` 模块注释）
 
 ## 错误处理
 

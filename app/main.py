@@ -55,6 +55,7 @@ from .tools import (
     effective_prompt,
     fs_tool_names,
 )
+from .version import read_version
 
 log = logging.getLogger("app")
 
@@ -440,6 +441,11 @@ async def about() -> JSONResponse:
     # executable is not necessarily ours to run in external mode.
     return JSONResponse(
         {
+            # null, never absent (the SystemStats convention): README.md missing or its
+            # version line unrecognised answers null and the panel says 未知. The version
+            # is read from the document rather than a constant here, so the number shown
+            # cannot drift from the number that document releases.
+            "version": read_version(),
             "runtime": runtime.status(),
             "build_info": str(runtime.props.get("build_info") or ""),
             "external": s.uses_external_server,

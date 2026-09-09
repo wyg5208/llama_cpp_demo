@@ -16,9 +16,9 @@ tools: Bash, Read, Grep
 |---|---|
 | 当前分支：`master` | 提交落在 `master`，不新建 release 分支，除非用户要求 |
 | `git remote -v` **输出为空**：没有配置任何远程 | 默认**只做到本地提交**，结果反馈里写"未推送（无远程）"；**禁止**擅自 `git remote add`，也禁止为"看起来完成了"而虚构推送成功 |
-| 版本号自 v1.0.0 起存在，**唯一来源是 `README.md` 顶部 `**版本 / Version**` 行**；`git tag` 当前为空 | 提交主题仍不加 `release: vx.x.x` 前缀；版本号只用于结果反馈与本地 tag |
-| 现有 9 条提交全部是**单行英文祈使句**，无 `feat:`/`release:` 前缀，例如 `Add export to MD, HTML, CSV, PDF and DOCX` | 沿用同一风格；不要改成中文正文或 Conventional Commits |
-| `.gitignore` 13 行，忽略 `.env`、`.venv/`、`__pycache__/`、`*.pyc`、`runtime/` | `git add .` 在本仓库是安全的（数百 MB 的 `runtime/llama-vulkan/`、会话归档、`.env` 都不会被暂存）；但**根目录的临时文件不在忽略列表内**，见第 5 节 |
+| 版本号自 v1.0.0 起存在，**唯一来源仍是 `README.md` 顶部 `**版本 / Version**` 行**，但自 v1.1.0 起有了官方读取入口 `app/version.py:read_version()`（关于面板显示的就是它的返回值）；本地 tag 自 v1.0.0 起随每次发布累积 | 取版本号优先调 `read_version()` 而不是自己 Grep（见第 3 节）；提交主题仍不加 `release: vx.x.x` 前缀；版本号只用于结果反馈与本地 tag |
+| `git log --oneline` 里的提交全部是**单行英文祈使句**，无 `feat:`/`release:` 前缀，例如 `Add export to MD, HTML, CSV, PDF and DOCX` | 沿用同一风格；不要改成中文正文或 Conventional Commits；不要把提交次数当事实写进文档（会随发布漂移） |
+| `.gitignore` 忽略 `.env`、`.venv/`、`__pycache__/`、`*.pyc`、`runtime/` | `git add .` 在本仓库是安全的（数百 MB 的 `runtime/llama-vulkan/`、会话归档、`.env` 都不会被暂存）；但**根目录的临时文件不在忽略列表内**，见第 5 节 |
 | `git ls-files runtime .venv .env` 计数为 0 | 作为提交前不变量复核，一旦非 0 说明有敏感/大文件被强行加入 |
 | PowerShell 5.1，且不支持 `&&` | 多命令用 `;` 分隔；单引号/双引号、换行与 BOM 的坑见第 5 节 |
 
@@ -36,9 +36,17 @@ git log --oneline -n 5
 
 ## 3. 版本信息提取
 
-用 `Grep` 在 `README.md` 匹配 `**版本 / Version**: v` 取出版本号（**不要按行号取**），与 `docs/开发记录/index.md` 顶部条目对账：
-- 一致 → 继续；
+**以 `app/version.py:read_version()` 为准**，它就是关于面板显示的那一个值，也是 `tests/test_version.py` 锁定的那条解析路径：
+
+```powershell
+$env:PYTHONIOENCODING="utf-8"; .\.venv\Scripts\python.exe -c "from app.version import read_version; print(read_version())"
+```
+
+返回不带 `v` 的裸数字（如 `1.1.0`）。输出 `None` 说明 README 版本行缺失或形制不匹配（全角冒号、缺修订号等）——**这是发布拦截信号而不是小瑕疵**：该行格式已被 `tests/test_version.py` 当作契约，tag 会打在一个界面上报「未知」的版本上，必须停下来请用户确认后再提交。取到值后再用 `Grep` 在 `README.md` 匹配 `**版本 / Version**: v` 做交叉对账（**不要按行号取**），并与 `docs/开发记录/index.md` 顶部条目比对：
+- 三者一致 → 继续；
 - 不一致 → 停下来报告差异（多半是 `iteration-doc` 未跑完或 README 被手改），请用户确认后再提交。
+
+拿 tag 与版本号对账：`git tag --list "v*"` 里不应已经存在第 3 节取到的版本号（已存在说明同一版本被发过两次，按第 5 节末尾 "tag 已存在" 的处置停下来问用户）。
 
 ## 4. 提交前安全与体积复核
 
@@ -110,7 +118,7 @@ git remote get-url origin   # 无输出/报错即没有远程
 ## 约束条件
 
 **必须执行：**
-- 提交前从 `README.md` 取版本号并与 `docs/开发记录/index.md` 对账（第 3 节）
+- 提交前用 `app/version.py:read_version()` 取版本号，并与 README 版本行、`docs/开发记录/index.md` 顶部对账（第 3 节）；它返回 `None` 时禁止继续发布
 - 发布提交完成后打本地轻量 tag `v{版本号}`（本仓库无远程，不推送 tag）
 - 提交前跑 `git status --short` 并逐条判断路径是否应入库
 - 提交风格与本仓历史一致（单行英文主题）；多段正文一律经 `runtime/.commit_msg.txt` + `git commit -F`，提交后删除该临时文件

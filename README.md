@@ -2,7 +2,7 @@
 
 一个跑在自己机器上的聊天式 AI 工作台：FastAPI 后端持有 `llama-server` 子进程，浏览器里的原生前端通过 SSE 逐字收答案，模型可以调用检索、文件、长期记忆等工具。所有推理都在本地，除检索后端外不依赖任何云端服务。
 
-**版本 / Version**: v1.0.0 | **更新日期 / Date**: 2026-09-09
+**版本 / Version**: v1.1.0 | **更新日期 / Date**: 2026-09-09
 **运行环境**: Windows + Python 3.11（仓库内 `.venv`）+ llama.cpp 预编译包（默认 Vulkan 后端）
 
 > 本文件是项目的总览与**版本号唯一来源**。配置项的逐项说明在 `.env.example`，历史变更在 `docs/开发记录/`。
@@ -56,7 +56,7 @@ llama_cpp_demo/
 ├── start_app.bat              启动外壳，只能纯 ASCII，逻辑全在 launcher.ps1
 ├── requirements.txt           运行时依赖（禁止非 ASCII 注释）
 ├── .env.example               全部配置项的中文说明；.env 的模板，是唯一权威文档
-├── app/                       后端，14 个模块
+├── app/                       后端，15 个模块
 │   ├── config.py              Settings + 字段校验器 + DEFAULT_SYSTEM_PROMPT + 日志装配
 │   ├── settings_store.py      运行时可改项的唯一权威（请求体即落盘白名单）
 │   ├── main.py                全部 /api/* 路由、SSE 对话、静态挂载
@@ -70,10 +70,11 @@ llama_cpp_demo/
 │   ├── export.py              出站：HTML → md/html/csv/pdf/docx
 │   ├── history.py             会话归档（index + 单文件）
 │   ├── memory_store.py        长期记忆 runtime/memory.json
-│   └── sysstats.py            顶栏遥测（Win32 + NVML）
+│   ├── sysstats.py            顶栏遥测（Win32 + NVML）
+│   └── version.py             读 README 版本行得到应用版本号（按 mtime 缓存，供关于面板用）
 ├── static/                    原生前端，无构建步骤：index.html + app.js + style.css
 ├── scripts/                   launcher.ps1 / fetch_runtime.py / fetch_mcp.py
-├── tests/                     8 个 unittest 文件，约 455 个用例
+├── tests/                     9 个 unittest 文件，466 个用例
 ├── docs/开发记录/             迭代记录（v{版本}_{日期}_{描述}.md）与 index.md 索引
 └── runtime/                   全部运行时产物，被 .gitignore 忽略
     ├── llama-vulkan/          llama.cpp 预编译包（数百 MB）
@@ -106,7 +107,7 @@ llama_cpp_demo/
 | GET | `/api/stats` | 机器遥测 |
 | GET / POST | `/api/models`、`/api/model` | 列出模型 / 切换模型 |
 | GET / PATCH / DELETE | `/api/settings` | 读设置（含掩码密钥）/ 改 8 项 / 清空覆写 |
-| GET | `/api/about` | runtime、build_info、模型体积、会话统计 |
+| GET | `/api/about` | 应用版本、runtime、build_info、模型体积、会话统计 |
 | GET / POST | `/api/sessions` | 会话索引 / 新建 |
 | GET / PATCH / DELETE | `/api/sessions/{id}` | 单个会话 |
 | GET / DELETE | `/api/memory`、`/api/memory/{id}` | 记忆列表 / 删除 |
@@ -121,7 +122,7 @@ llama_cpp_demo/
 $env:PYTHONIOENCODING="utf-8"; .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-当前 455 个用例（含 2 个 skip），耗时 20~35 秒（视磁盘缓存）。跑单个文件：`.\.venv\Scripts\python.exe -m unittest tests.test_export -v`。**本项目不引入 pytest**（标准库足够，且已装依赖越少越好）。
+当前 466 个用例（含 2 个 skip），耗时 20~35 秒（视磁盘缓存）。跑单个文件：`.\.venv\Scripts\python.exe -m unittest tests.test_export -v`。**本项目不引入 pytest**（标准库足够，且已装依赖越少越好）。版本号四处落点的一致性由 `tests/test_version.py` 负责，改动 `README.md` 顶部版本行后至少跑一次它。
 
 ## 7. 仓库约定（红线）
 
@@ -137,9 +138,22 @@ $env:PYTHONIOENCODING="utf-8"; .\.venv\Scripts\python.exe -m unittest discover -
 - 版本号遵循语义化 `MAJOR.MINOR.PATCH`：**修订号 +1** = bug 修复、配置/文案、UI 微调、依赖更新；**次版本号 +1**（修订归零）= 新增功能、新增 `/api` 端点或工具、新增配置项；**主版本号 +1**（其余归零）= 架构重构、runtime 后端策略变更、依赖策略变更等不兼容改动。
 - 每次迭代由 `iteration-doc` 智能体生成 `docs/开发记录/v{版本号}_{日期}_{功能描述}.md`，并在 `docs/开发记录/index.md` 顶部追加一行。
 - 版本号同步的落点（四处）：本文件顶部 `**版本 / Version**` 行、本文件第 9 节版本历史、迭代记录文档（文件名与「基本信息」）、`docs/开发记录/index.md`。本仓库尚无远程，发布提交上的本地 `git tag vX.Y.Z` 由 `version-release` 负责。
+- 顶部 `**版本 / Version**: vX.Y.Z` 这一行的**格式是契约**，不是排版：它是应用版本号的唯一读取源（`app/version.py:read_version()` → `/api/about` 的 `version` 字段 → 侧边栏关于面板首行「应用版本」），四处落点之间的一致性由 `tests/test_version.py` 校验；改动该行的写法会让关于面板显示「未知」并让测试失败。
 - 提交由 `version-release` 智能体完成：单行英文祈使句主题，不带 `feat:`/`release:` 前缀。
 
 ## 9. 版本历史
+
+### v1.1.0 — 2026-09-09
+
+应用自己的版本号进入运行时：
+
+- ✅ 新增 `app/version.py`：`read_version()` 从本文件顶部版本行正则取版本号，按 `(路径, mtime_ns, size)` 缓存，改 README 免重启即生效
+- ✅ 容错不抛异常：文件缺失 / 非 UTF-8 / 版本行形制不匹配一律返回 `None` 并 `log.warning` 一次，面板显示「未知」而非 500
+- ✅ `/api/about` 新增 `version` 字段（约定同 SystemStats：取不到时为 `null` 而非缺字段）
+- ✅ 侧边栏关于面板首行新增「应用版本」；`v` 前缀只在前端拼，接口回传裸数字便于与 `git tag` 对账
+- ✅ 新增 `tests/test_version.py`（11 用例）：README 成为唯一源的读取/缓存行为 + 四处落点一致性 + `/api/about` 契约
+- ✅ 刻意不把版本号做成 `Settings` 字段：它不可由用户配置，不该进 `.env` / `.env.example` / `SettingsPatch` 白名单
+- ✅ 回归基线：`unittest` 466 用例
 
 ### v1.0.0 — 2026-09-09
 

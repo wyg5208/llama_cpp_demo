@@ -2089,6 +2089,11 @@ async function loadAbout() {
   if (r.vision) caps.push("图片理解");
   if (r.tools !== false) caps.push("工具调用 / 联网检索");
   const rows = [
+    // First row because it is what a bug report quotes. `a.version` is null when
+    // README.md is absent or its version line is unrecognised (app/version.py); the "v"
+    // is added here rather than server-side so the payload stays a bare number the
+    // release tag can be compared against.
+    ["应用版本", a.version ? `v${a.version}` : "未知（未能从 README.md 读到版本行）"],
     ["运行状态", `${STATE_TEXT[r.state] || r.state || "–"}${r.detail ? ` — ${String(r.detail).split("\n")[0]}` : ""}`],
     ["推理后端", `${r.backend || "–"}${a.external ? "（外部 llama-server，不由本应用启动）" : ""}`],
     ["服务地址", r.base_url || "–"],
