@@ -15,7 +15,7 @@ tools: Read, Write, SearchReplace, Grep, Glob, Bash
 | 实际现状 | 对流程的影响 |
 |---|---|
 | `README.md` 自 v1.0.0 起存在，是**版本号唯一来源**（顶部 `**版本 / Version**` 行 + 第 9 节版本历史）；自 v1.1.0 起该行的**机器读取入口是 `app/version.py:read_version()`**（结果经 `/api/about` 的 `version` 字段显示到关于面板），格式由 `tests/test_version.py` 锁定 | 读版本号一律用 `read_version()`（它就是界面显示的那个值），自检命令见第 1.1 节；不要按行号取（正文会变长）；Grep 匹配 `**版本 / Version**` 只作交叉对账；不改动与本次迭代无关的 README 章节 |
-| 本仓库无远程仓库；本地 tag 只出现在发布提交上 | 本 agent 不打 tag、不碰远程，tag 由 `version-release` 负责 |
+| 远程为 `origin  git@github.com:wyg5208/llama_cpp_demo.git`（SSH），tag 只出现在发布提交上 | 本 agent 不打 tag、不推送，提交与推送由 `version-release` 负责 |
 | `docs/开发记录/` 已建好，`index.md` 已有表头与历史条目（条目数不写死） | 直接写记录文件并在 index 顶部追加条目；不重建目录、不改写已有表头与历史条目 |
 | `.gitignore` 忽略 `.env`、`.venv/`、`__pycache__/`、`*.pyc`、`runtime/` | `runtime/` 下的会话归档、日志、模型二进制、`mcp/node_modules/` 一律不入库，也不得出现在交付物清单里；引用该文件时写它忽略的路径，不写行数 |
 | 测试是标准库 `unittest`（项目明确拒绝引入 pytest） | 验证命令一律用 `python -m unittest` |

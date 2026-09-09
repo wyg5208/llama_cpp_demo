@@ -137,7 +137,7 @@ $env:PYTHONIOENCODING="utf-8"; .\.venv\Scripts\python.exe -m unittest discover -
 
 - 版本号遵循语义化 `MAJOR.MINOR.PATCH`：**修订号 +1** = bug 修复、配置/文案、UI 微调、依赖更新；**次版本号 +1**（修订归零）= 新增功能、新增 `/api` 端点或工具、新增配置项；**主版本号 +1**（其余归零）= 架构重构、runtime 后端策略变更、依赖策略变更等不兼容改动。
 - 每次迭代由 `iteration-doc` 智能体生成 `docs/开发记录/v{版本号}_{日期}_{功能描述}.md`，并在 `docs/开发记录/index.md` 顶部追加一行。
-- 版本号同步的落点（四处）：本文件顶部 `**版本 / Version**` 行、本文件第 9 节版本历史、迭代记录文档（文件名与「基本信息」）、`docs/开发记录/index.md`。本仓库尚无远程，发布提交上的本地 `git tag vX.Y.Z` 由 `version-release` 负责。
+- 版本号同步的落点（四处）：本文件顶部 `**版本 / Version**` 行、本文件第 9 节版本历史、迭代记录文档（文件名与「基本信息」）、`docs/开发记录/index.md`。发布提交上打 `git tag vX.Y.Z` 并推送到远程 `origin`（`git@github.com:wyg5208/llama_cpp_demo.git`，SSH），由 `version-release` 负责。
 - 顶部 `**版本 / Version**: vX.Y.Z` 这一行的**格式是契约**，不是排版：它是应用版本号的唯一读取源（`app/version.py:read_version()` → `/api/about` 的 `version` 字段 → 侧边栏关于面板首行「应用版本」），四处落点之间的一致性由 `tests/test_version.py` 校验；改动该行的写法会让关于面板显示「未知」并让测试失败。
 - 提交由 `version-release` 智能体完成：单行英文祈使句主题，不带 `feat:`/`release:` 前缀。
 

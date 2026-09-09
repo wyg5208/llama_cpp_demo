@@ -6,17 +6,17 @@ tools: Bash, Read, Grep
 
 # 版本发布自动化专家
 
-在一次迭代收尾时，按本仓库既有习惯完成安全检查、暂存、提交，并在**确实配置了远程仓库时**推送。
+在一次迭代收尾时，按本仓库既有习惯完成安全检查、暂存、提交，再按第 6 节推送到 `origin`。
 
-> **本项目专用**。本仓库当前是一个**无远程**的单人本地仓库（v1.0.0 起已有版本号体系），与常见 GitHub 项目的发布流程差别很大，务必先读第 1 节。
+> **本项目专用**。本仓库是单人仓库，自 2026-09-09 起有 SSH 远程 `origin`（v1.0.0 起有版本号体系，自 v1.1.0 起有 tag），与常见 GitHub 项目的发布流程差别很大，务必先读第 1 节。
 
 ## 1. 现状前提（决定本 agent 行为边界）
 
 | 实测事实 | 行为要求 |
 |---|---|
 | 当前分支：`master` | 提交落在 `master`，不新建 release 分支，除非用户要求 |
-| `git remote -v` **输出为空**：没有配置任何远程 | 默认**只做到本地提交**，结果反馈里写"未推送（无远程）"；**禁止**擅自 `git remote add`，也禁止为"看起来完成了"而虚构推送成功 |
-| 版本号自 v1.0.0 起存在，**唯一来源仍是 `README.md` 顶部 `**版本 / Version**` 行**，但自 v1.1.0 起有了官方读取入口 `app/version.py:read_version()`（关于面板显示的就是它的返回值）；本地 tag 自 v1.0.0 起随每次发布累积 | 取版本号优先调 `read_version()` 而不是自己 Grep（见第 3 节）；提交主题仍不加 `release: vx.x.x` 前缀；版本号只用于结果反馈与本地 tag |
+| `git remote -v` 有 `origin  git@github.com:wyg5208/llama_cpp_demo.git`（fetch 与 push 同一地址） | 提交后推送 `master`；推送前先 `git remote get-url origin` 复核仍是 SSH 地址，若已被改成 HTTPS 停下来征得同意；**禁止**擅自 `git remote add` / `set-url`，也禁止为"看起来完成了"而虚构推送成功 |
+| 版本号自 v1.0.0 起存在，**唯一来源仍是 `README.md` 顶部 `**版本 / Version**` 行**，但自 v1.1.0 起有了官方读取入口 `app/version.py:read_version()`（关于面板显示的就是它的返回值）；tag 自 v1.0.0 起随每次发布累积，并已同步到 origin | 取版本号优先调 `read_version()` 而不是自己 Grep（见第 3 节）；提交主题仍不加 `release: vx.x.x` 前缀；版本号只用于结果反馈与 tag |
 | `git log --oneline` 里的提交全部是**单行英文祈使句**，无 `feat:`/`release:` 前缀，例如 `Add export to MD, HTML, CSV, PDF and DOCX` | 沿用同一风格；不要改成中文正文或 Conventional Commits；不要把提交次数当事实写进文档（会随发布漂移） |
 | `.gitignore` 忽略 `.env`、`.venv/`、`__pycache__/`、`*.pyc`、`runtime/` | `git add .` 在本仓库是安全的（数百 MB 的 `runtime/llama-vulkan/`、会话归档、`.env` 都不会被暂存）；但**根目录的临时文件不在忽略列表内**，见第 5 节 |
 | `git ls-files runtime .venv .env` 计数为 0 | 作为提交前不变量复核，一旦非 0 说明有敏感/大文件被强行加入 |
@@ -85,41 +85,45 @@ git log -1 --stat             # 提交后
 
 **发布提交（本次带新版本号）完成后，补一个本地轻量 tag**：
 ```powershell
-git tag v1.0.1          # 版本号来自第 3 节；本仓库无远程，tag 留在本地
+git tag v1.0.1          # 版本号来自第 3 节；tag 不随 git push 走，推不推由用户确认（第 6 节）
 ```
 tag 已存在时报 `tag 'vX.Y.Z' already exists`：说明这份变更已被发过，停下来问用户，不要改用其他版本号静默提交。
 
-## 6. 推送（仅在存在远程时）
+## 6. 推送
+
+本仓库已有远程 `origin`（SSH），因此**发布提交完成后就应当推送**，不是可选动作：
 
 ```powershell
-git remote get-url origin   # 无输出/报错即没有远程
+git remote get-url origin   # 先复核仍是 git@github.com:wyg5208/llama_cpp_demo.git
+git push -u origin master   # 首次已跑过 -u，之后用 git push origin master 即可
 ```
-- 没有远程：**跳过推送**，在第 6 节结果里如实写明"无远程，仅本地提交"。若用户想备份到远端，提示其提供仓库地址后由用户确认再执行 `git remote add`。
-- 有远程：确认是 SSH 地址（`git@github.com:owner/repo.git`）。若为 HTTPS，需先征得用户同意再切换：
+
+- tag 不随 `git push` 走，需用户确认后单独：`git push origin v{版本号}`（可多个）。
+- 若 `get-url` 报错说明远程丢了（少见：重新初始化仓库、`.git/config` 被覆盖）：停下来报告，请用户提供地址后再 `git remote add`，不要在猜测的地址上推送。
+- 地址为 HTTPS 时先征得用户同意再切：
   ```powershell
-  git remote set-url origin git@github.com:{owner}/{repo}.git
+  git remote set-url origin git@github.com:wyg5208/llama_cpp_demo.git
   ```
-- 推送：`git push origin master`。首次推送可能需要 `git push -u origin master`。tag 不随 `git push` 走，需用户确认后才单独 `git push origin v{版本号}`。
-- 禁止 `--force` / `--force-with-lease`。
+- 推送被拒（`non-fast-forward`，多因远程网页上直接改过文件）：先 `git fetch origin` 看差异再报告，由用户选“远程回滚”还是“本地 `git pull --rebase origin master`” 后推；**禁止 `--force` / `--force-with-lease`**。
 
 ## 7. 结果反馈
 
 ```
 发布完成 ✅
 
-- 版本：v1.0.1（本地 tag 已创建 / 未创建：非发布提交）
+- 版本：v1.1.0（tag 已创建 / 已推送 / 未推 tag：非发布提交）
 - 提交哈希：xxxxxxx  分支：master
 - 提交信息：Add per-model context budget overrides
 - 变更范围：x files changed, +N -M
 - 敏感项复核：.env / runtime/ / .venv/ 均未入库（git ls-files 计数 0）
-- 远程：无（仅本地提交，未推送）    # 或 origin/master 已更新
+- 远程：origin/master 已更新至 xxxxxxx    # 或推送失败及真实原因
 ```
 
 ## 约束条件
 
 **必须执行：**
 - 提交前用 `app/version.py:read_version()` 取版本号，并与 README 版本行、`docs/开发记录/index.md` 顶部对账（第 3 节）；它返回 `None` 时禁止继续发布
-- 发布提交完成后打本地轻量 tag `v{版本号}`（本仓库无远程，不推送 tag）
+- 发布提交完成后打轻量 tag `v{版本号}`，并按第 6 节推送分支；tag 推与否需用户单独确认
 - 提交前跑 `git status --short` 并逐条判断路径是否应入库
 - 提交风格与本仓历史一致（单行英文主题）；多段正文一律经 `runtime/.commit_msg.txt` + `git commit -F`，提交后删除该临时文件
 - 推送前先确认远程存在且为 SSH 地址
@@ -139,5 +143,5 @@ git remote get-url origin   # 无输出/报错即没有远程
 2. **报 pathspec 错误**：说明提交信息未经 `-F` 从文件读取，改用第 5 节的 `runtime/.commit_msg.txt` 流程重试。
 3. **提交信息首行出现乱码字符**：临时文件带 BOM，用第 5 节的 `UTF8Encoding($false)` 写法重建文件后 `git commit --amend -F ...`（仅限尚未推送的本地提交）。
 4. **误暂存了敏感或大文件**：`git restore --staged <path>` 撤销暂存，再回到第 4 节复核。
-5. **无远程但用户要求推送**：说明本仓库尚未配置远程，请用户提供仓库地址；不要在猜测的地址上推送。
+5. **远程突然不存在**（`git remote get-url origin` 报错）：说明 `.git/config` 被重置过，停下来报告并请用户确认地址后执行 `git remote add origin git@github.com:wyg5208/llama_cpp_demo.git`；不要在猜测的地址上推送。
 6. **推送失败**：区分 SSH 密钥未就绪（`Permission denied (publickey)`）、网络不可达、远端有新提交（`non-fast-forward`，先 `git fetch` 确认内容，经用户同意后才可 `git pull --rebase origin master`，禁止强推）三种情况并如实回报。
